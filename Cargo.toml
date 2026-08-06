@@ -1,0 +1,8 @@
+[package]
+name = "bluerat"
+version = "0.1.0"
+edition = "2024"
+description = "TUI Bluetooth manager for Linux"
+
+[dependencies]
+ratatui = "0.30"

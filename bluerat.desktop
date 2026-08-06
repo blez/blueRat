@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=blueRat
+GenericName=Bluetooth Manager
+Comment=TUI Bluetooth manager for Linux
+Exec=bluerat
+Icon=bluerat
+Terminal=true
+Categories=Utility;System;Settings;
+Keywords=bluetooth;pair;connect;audio;
