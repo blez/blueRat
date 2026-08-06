@@ -46,7 +46,8 @@ fn short_sink_input_ids() -> Vec<String> {
 /// Make a freshly-connected audio device the default output and move all
 /// existing streams to it. Waits up to 8s for the sink to appear; if it never
 /// does (e.g. a mouse), silently gives up — that matches the script.
-pub fn route_audio(mac: &str, status: impl Fn(String)) {
+/// Returns true when audio was actually routed.
+pub fn route_audio(mac: &str, progress: impl Fn(String)) -> bool {
     let mac_us = mac.replace(':', "_");
     let mut sink = None;
     // One immediate check, then up to 8 sleep-and-recheck rounds, so the full
@@ -60,17 +61,17 @@ pub fn route_audio(mac: &str, status: impl Fn(String)) {
             break;
         }
         if attempt < 8 {
-            status(format!("Waiting for audio sink… ({}/8)", attempt + 1));
+            progress(format!("Waiting for audio sink… ({}/8)", attempt + 1));
         }
     }
-    let Some(sink) = sink else { return };
+    let Some(sink) = sink else { return false };
     if !pactl(&["set-default-sink", &sink]).0 {
-        return;
+        return false;
     }
     for id in short_sink_input_ids() {
         pactl(&["move-sink-input", &id, &sink]);
     }
-    status("Audio routed".to_string());
+    true
 }
 
 #[cfg(test)]

@@ -41,3 +41,7 @@ make install          # install binary, icon and .desktop to ~/.local
 make PREFIX=/usr/local install   # system-wide instead
 make test             # unit tests
 ```
+
+`assets/icon.png` is the icon master (512px, transparent background);
+`assets/icon-256.png` is the launcher-size derivative that `make install`
+places into the hicolor theme.

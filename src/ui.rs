@@ -17,20 +17,34 @@ use ratatui::widgets::{
 use crate::app::{App, View};
 use crate::worker::Tone;
 
-// Brand palette (assets/banner.png).
-const STEEL: Color = Color::Rgb(0x35, 0x61, 0x8c); // outer frame
-const STEEL_DIM: Color = Color::Rgb(0x25, 0x38, 0x50); // panel borders, tracks
-const BLUE: Color = Color::Rgb(0x53, 0x88, 0xbd); // wordmark "blue", panel titles
-const ICE: Color = Color::Rgb(0x69, 0xc4, 0xe6); // bright highlights, counters
-const SNOW: Color = Color::Rgb(0xdc, 0xe8, 0xf5); // bright text, wordmark "Rat"
-const TEXT: Color = Color::Rgb(0xa8, 0xb8, 0xcc); // regular text
-const SLATE: Color = Color::Rgb(0x5d, 0x6f, 0x85); // muted text, MACs, brackets
-const ORANGE: Color = Color::Rgb(0xd9, 0x77, 0x42); // keys, prompt ❯, busy
-const GREEN: Color = Color::Rgb(0x59, 0xa9, 0x6d); // connected / success
-const RED: Color = Color::Rgb(0xd1, 0x69, 0x69); // destructive / failure
-const SEL_BG: Color = Color::Rgb(0x24, 0x40, 0x5e); // selection bar
+// Brand palette (assets/banner.png), brightened for terminal contrast.
+const STEEL: Color = Color::Rgb(0x4a, 0x7f, 0xb8); // outer frame
+const STEEL_DIM: Color = Color::Rgb(0x31, 0x4d, 0x70); // panel borders, tracks
+const BLUE: Color = Color::Rgb(0x6a, 0xa3, 0xe0); // wordmark "blue", panel titles
+const ICE: Color = Color::Rgb(0x7f, 0xd6, 0xff); // bright highlights, counters
+const SNOW: Color = Color::Rgb(0xee, 0xf6, 0xff); // bright text, wordmark "Rat"
+const TEXT: Color = Color::Rgb(0xc2, 0xd4, 0xe8); // regular text
+const SLATE: Color = Color::Rgb(0x77, 0x8d, 0xa8); // muted text, MACs, brackets
+const ORANGE: Color = Color::Rgb(0xff, 0x8c, 0x4a); // keys, prompt ❯, busy
+const GREEN: Color = Color::Rgb(0x5f, 0xd7, 0x84); // connected / success
+const RED: Color = Color::Rgb(0xf2, 0x6d, 0x6d); // destructive / failure
+const SEL_BG: Color = Color::Rgb(0x2e, 0x54, 0x80); // selection bar
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+// Responsive log layout. Invariant: at the breakpoint, the side panel takes
+// max(SIDE_LOG_MIN, 35%) columns and the device panel keeps at least
+// CONTENT_MIN — SIDE_LOG_BREAKPOINT - SIDE_LOG_MIN must stay >= CONTENT_MIN.
+const SIDE_LOG_BREAKPOINT: u16 = 90;
+const SIDE_LOG_RATIO: u32 = 35; // percent of total width
+const SIDE_LOG_MIN: u16 = 34;
+const CONTENT_MIN: u16 = 40;
+
+/// Where the event log renders this frame.
+enum LogSlot {
+    Bottom(Rect),
+    Side(Rect),
+}
 
 fn fg(c: Color) -> Style {
     Style::new().fg(c)
@@ -71,8 +85,30 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let inner = outer.inner(frame.area());
     frame.render_widget(outer, frame.area());
 
-    let [panel_area, status_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(inner);
+    let log = log_lines(app);
+    // Wide terminals get a banner-style console panel on the right (stable
+    // layout, mirrors the banner composition); narrow ones keep the log at
+    // the bottom.
+    let (panel_area, log_slot) = if inner.width >= SIDE_LOG_BREAKPOINT {
+        // At least 35% of the width, never below the readable minimum.
+        // u32 math: u16 would overflow at ~1873 columns.
+        let side_w = ((inner.width as u32 * SIDE_LOG_RATIO / 100) as u16).max(SIDE_LOG_MIN);
+        let [content, side] =
+            Layout::horizontal([Constraint::Min(CONTENT_MIN), Constraint::Length(side_w)])
+                .areas(inner);
+        (content, LogSlot::Side(side))
+    } else {
+        // Constant height while anything is logged or running, so the device
+        // list doesn't jump on every entry push/expiry.
+        let h = if log.is_empty() {
+            1
+        } else {
+            crate::app::LOG_MAX as u16 + 1
+        };
+        let [content, bottom] =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(h)]).areas(inner);
+        (content, LogSlot::Bottom(bottom))
+    };
 
     match &app.view {
         View::ScanResults { items, selected } => {
@@ -155,7 +191,25 @@ pub fn draw(frame: &mut Frame, app: &App) {
         }
     }
 
-    frame.render_widget(status_line(app), status_area);
+    match log_slot {
+        LogSlot::Bottom(area) => {
+            let lines = fit_tail(log, area.width, area.height);
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        }
+        LogSlot::Side(area) => {
+            let block = Block::bordered()
+                .border_style(fg(STEEL_DIM))
+                .title(Line::from(vec![
+                    Span::styled(" [", fg(SLATE)),
+                    Span::styled("blueRat", bold(BLUE)),
+                    Span::styled("] ", fg(SLATE)),
+                ]));
+            let content = block.inner(area);
+            frame.render_widget(block, area);
+            let lines = fit_tail(log, content.width, content.height);
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), content);
+        }
+    }
 
     if let View::ConfirmRemove { name, mac } = &app.view {
         // Width fits the longest line, "Remove (unpair) <name>?" (17 cells of
@@ -197,33 +251,66 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-/// Banner-style prompt line: orange `❯`, message colored by its severity.
-fn status_line(app: &App) -> Line<'static> {
+fn tone_style(tone: Tone) -> Style {
+    match tone {
+        Tone::Err => bold(RED),
+        Tone::Warn => fg(ORANGE),
+        Tone::Ok => fg(GREEN),
+        Tone::Info => fg(ICE),
+    }
+}
+
+/// Banner-console-style event log: `❯`-prefixed lines colored by severity,
+/// all but the newest dimmed, plus a spinner line carrying the live progress
+/// text while an operation runs.
+fn log_lines(app: &App) -> Vec<Line<'static>> {
+    let n = app.log.len();
+    let mut lines: Vec<Line> = app
+        .log
+        .iter()
+        .enumerate()
+        .map(|(i, (msg, tone, _))| {
+            let (prompt, style) = if i + 1 == n {
+                (bold(ORANGE), tone_style(*tone))
+            } else {
+                (bold(ORANGE).dim(), tone_style(*tone).dim())
+            };
+            Line::from(vec![
+                Span::styled(" ❯ ", prompt),
+                Span::styled(msg.clone(), style),
+            ])
+        })
+        .collect();
     if let Some(busy) = &app.busy {
         let spin = SPINNER[app.tick as usize % SPINNER.len()];
-        let text = app
-            .status
-            .as_ref()
-            .map(|(msg, _, _)| msg.clone())
-            .unwrap_or_else(|| busy.clone());
-        return Line::from(vec![
+        let text = app.progress.clone().unwrap_or_else(|| busy.clone());
+        lines.push(Line::from(vec![
             Span::styled(format!(" {spin} "), bold(ORANGE)),
             Span::styled(text, fg(SNOW)),
-        ]);
+        ]));
     }
-    if let Some((msg, tone, _)) = &app.status {
-        let style = match tone {
-            Tone::Err => bold(RED),
-            Tone::Warn => fg(ORANGE),
-            Tone::Ok => fg(GREEN),
-            Tone::Info => fg(ICE),
-        };
-        return Line::from(vec![
-            Span::styled(" ❯ ", bold(ORANGE)),
-            Span::styled(msg.clone(), style),
-        ]);
+    lines
+}
+
+/// Keep the newest lines that fit `height` rows at `width` (accounting for
+/// wrapping), dropping the oldest — the spinner and latest events must never
+/// be the ones clipped.
+fn fit_tail(lines: Vec<Line<'static>>, width: u16, height: u16) -> Vec<Line<'static>> {
+    if width == 0 || height == 0 {
+        return Vec::new();
     }
-    Line::default()
+    let mut rows = 0u16;
+    let mut kept: Vec<Line> = Vec::new();
+    for line in lines.into_iter().rev() {
+        let need = (line.width().max(1) as u16).div_ceil(width);
+        if rows + need > height {
+            break;
+        }
+        rows += need;
+        kept.push(line);
+    }
+    kept.reverse();
+    kept
 }
 
 /// `─[Enter→Toggle]─[s→Pair new]─…` chips for the bottom border.

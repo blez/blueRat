@@ -43,7 +43,12 @@ pub enum Tone {
 pub enum Msg {
     Devices(Vec<Device>),
     ScanResults(Vec<Discovered>),
+    /// A finished event for the log.
     Status(String, Tone),
+    /// Live narration of the running operation ("Connecting X…",
+    /// "Waiting for audio sink… (3/8)"). Shown on the spinner line and
+    /// replaced by the next progress message — never logged.
+    Progress(String),
     OpDone,
 }
 
@@ -81,11 +86,16 @@ pub fn spawn(rx: Receiver<Cmd>, tx: Sender<Msg>, audio_available: bool) {
 /// Returns false when the UI side hung up.
 fn run(cmd: Cmd, tx: &Sender<Msg>, audio_available: bool) -> bool {
     let status = |s: String, t: Tone| tx.send(Msg::Status(s, t)).is_ok();
+    let progress = |s: String| {
+        let _ = tx.send(Msg::Progress(s));
+    };
     let route = |mac: &str| {
-        if audio_available {
-            audio::route_audio(mac, |s| {
-                let _ = tx.send(Msg::Status(s, Tone::Info));
-            });
+        if audio_available
+            && audio::route_audio(mac, |s| {
+                let _ = tx.send(Msg::Progress(s));
+            })
+        {
+            let _ = tx.send(Msg::Status("Audio routed".into(), Tone::Ok));
         }
     };
 
@@ -110,14 +120,14 @@ fn run(cmd: Cmd, tx: &Sender<Msg>, audio_available: bool) -> bool {
                 }
             };
             if info.connected {
-                status(format!("Disconnecting {name}…"), Tone::Info);
+                progress(format!("Disconnecting {name}…"));
                 if bt::disconnect(&mac) {
                     status(format!("Disconnected {name}"), Tone::Ok);
                 } else {
                     status(format!("Failed to disconnect {name}"), Tone::Err);
                 }
             } else {
-                status(format!("Connecting {name}…"), Tone::Info);
+                progress(format!("Connecting {name}…"));
                 if bt::connect(&mac) {
                     // Only audio-sink devices grow a sink — don't make mice
                     // and keyboards wait through the 8s sink poll.
@@ -138,10 +148,7 @@ fn run(cmd: Cmd, tx: &Sender<Msg>, audio_available: bool) -> bool {
                 status(e, Tone::Err);
                 return true;
             }
-            status(
-                "Scanning ~10s — put the device in pairing mode…".into(),
-                Tone::Info,
-            );
+            progress("Scanning ~10s — put the device in pairing mode…".into());
             bt::scan(10);
             match bt::discovered_unpaired() {
                 Ok(found) => {
@@ -160,7 +167,7 @@ fn run(cmd: Cmd, tx: &Sender<Msg>, audio_available: bool) -> bool {
                 status(e, Tone::Err);
                 return true;
             }
-            status(format!("Pairing {name}…"), Tone::Info);
+            progress(format!("Pairing {name}…"));
             if !bt::pair(&mac) {
                 status(
                     format!("Pairing failed: {name} — pick a device to retry, Esc to leave"),
@@ -171,7 +178,7 @@ fn run(cmd: Cmd, tx: &Sender<Msg>, audio_available: bool) -> bool {
                 return tx.send(Msg::ScanResults(others)).is_ok();
             }
             bt::trust(&mac);
-            status(format!("Connecting {name}…"), Tone::Info);
+            progress(format!("Connecting {name}…"));
             if bt::connect(&mac) {
                 if bt::info(&mac).map(|i| i.audio).unwrap_or(false) {
                     route(&mac);

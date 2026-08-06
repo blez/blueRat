@@ -29,11 +29,13 @@ clippy:
 
 install: release
 	install -Dm755 target/release/$(BIN) $(PREFIX)/bin/$(BIN)
-	install -Dm644 assets/icon.png $(PREFIX)/share/icons/hicolor/1024x1024/apps/$(BIN).png
+	install -Dm644 assets/icon-256.png $(PREFIX)/share/icons/hicolor/256x256/apps/$(BIN).png
 	install -Dm644 $(BIN).desktop $(PREFIX)/share/applications/$(BIN).desktop
+	rm -f $(PREFIX)/share/icons/hicolor/1024x1024/apps/$(BIN).png  # legacy path from old installs
 
 uninstall:
 	rm -f $(PREFIX)/bin/$(BIN) \
+	      $(PREFIX)/share/icons/hicolor/256x256/apps/$(BIN).png \
 	      $(PREFIX)/share/icons/hicolor/1024x1024/apps/$(BIN).png \
 	      $(PREFIX)/share/applications/$(BIN).desktop
 

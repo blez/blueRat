@@ -45,15 +45,16 @@ fn main() {
     worker::spawn(cmd_rx, msg_tx, audio_available);
 
     let mut app = App::new();
+    app.push_log("Initializing Bluetooth…".into(), worker::Tone::Info);
     if !audio_available {
-        app.set_status(
+        app.push_log(
             "audio auto-routing disabled ('pactl' not found)".into(),
             worker::Tone::Warn,
         );
     }
 
     // Initial load also powers the adapter on if needed.
-    app.busy = Some("Loading…".into());
+    app.begin("Loading…");
     let _ = cmd_tx.send(Cmd::Refresh);
 
     let mut terminal = ratatui::init();

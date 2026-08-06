@@ -7,7 +7,13 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::bt::{Device, Discovered};
 use crate::worker::{Cmd, Msg, Tone};
 
-const STATUS_TTL: Duration = Duration::from_secs(4);
+/// Info/Ok log entries disappear this long after being pushed. Warn/Err
+/// entries stay until the next operation starts (their instructions remain
+/// actionable until the user acts again).
+const LOG_TTL: Duration = Duration::from_secs(8);
+/// At most this many event-log lines are kept (pub: the UI derives the
+/// bottom-log area height from it).
+pub const LOG_MAX: usize = 4;
 
 pub enum View {
     DeviceList,
@@ -26,7 +32,10 @@ pub struct App {
     pub selected: usize,
     pub view: View,
     pub busy: Option<String>,
-    pub status: Option<(String, Tone, Instant)>,
+    /// Live narration of the running operation, shown on the spinner line.
+    pub progress: Option<String>,
+    /// Banner-console-style event log: newest last.
+    pub log: Vec<(String, Tone, Instant)>,
     pub tick: u64,
     pub quit: bool,
 }
@@ -38,7 +47,8 @@ impl App {
             selected: 0,
             view: View::DeviceList,
             busy: None,
-            status: None,
+            progress: None,
+            log: Vec::new(),
             tick: 0,
             quit: false,
         }
@@ -46,22 +56,26 @@ impl App {
 
     pub fn on_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
-        if let Some((_, _, at)) = &self.status
-            && at.elapsed() > STATUS_TTL
-        {
-            self.status = None;
+        // Warn/Err survive the TTL; they expire in begin() instead.
+        self.log
+            .retain(|(_, t, at)| matches!(t, Tone::Warn | Tone::Err) || at.elapsed() <= LOG_TTL);
+    }
+
+    /// Append a finished event to the log. Live progress goes through
+    /// `Msg::Progress` instead and never lands here.
+    pub fn push_log(&mut self, s: String, tone: Tone) {
+        self.log.push((s, tone, Instant::now()));
+        if self.log.len() > LOG_MAX {
+            self.log.remove(0);
         }
     }
 
-    pub fn set_status(&mut self, s: String, tone: Tone) {
-        self.status = Some((s, tone, Instant::now()));
-    }
-
-    /// Mark an operation as started: set the busy label and drop any leftover
-    /// status so the previous op's result isn't shown as live progress.
-    fn begin(&mut self, label: &str) {
+    /// Mark an operation as started. The user is acting again, so warnings
+    /// and errors that outlived their TTL stop being pinned.
+    pub fn begin(&mut self, label: &str) {
         self.busy = Some(label.to_string());
-        self.status = None;
+        self.progress = None;
+        self.log.retain(|(_, _, at)| at.elapsed() <= LOG_TTL);
     }
 
     pub fn handle_msg(&mut self, msg: Msg) {
@@ -82,8 +96,12 @@ impl App {
                     self.view = View::ScanResults { items, selected: 0 };
                 }
             }
-            Msg::Status(s, tone) => self.set_status(s, tone),
-            Msg::OpDone => self.busy = None,
+            Msg::Status(s, tone) => self.push_log(s, tone),
+            Msg::Progress(s) => self.progress = Some(s),
+            Msg::OpDone => {
+                self.busy = None;
+                self.progress = None;
+            }
         }
     }
 
