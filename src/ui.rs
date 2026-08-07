@@ -54,13 +54,19 @@ fn bold(c: Color) -> Style {
     Style::new().fg(c).bold()
 }
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let hints: &[(&str, &str)] = match &app.view {
         View::ScanResults { .. } => &[("Enter", "Pair"), ("j/k", "Move"), ("Esc", "Back")],
         View::ConfirmRemove { .. } => &[("y", "Yes"), ("n", "No")],
+        View::Details { .. } => &[("j/k", "Scroll"), ("Esc", "Close")],
+        View::PairPrompt { pin: true, .. } => &[("Enter", "Submit"), ("Esc", "Cancel")],
+        View::PairPrompt { .. } => &[("y", "Yes"), ("n", "No")],
         View::DeviceList => &[
             ("Enter", "Toggle"),
-            ("s", "Pair new"),
+            ("s", "Scan"),
+            ("a", "Audio"),
+            ("i", "Info"),
+            ("/", "Filter"),
             ("t", "Trust"),
             ("x", "Remove"),
             ("r", "Refresh"),
@@ -112,31 +118,47 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     match &app.view {
         View::ScanResults { items, selected } => {
-            let rows: Vec<ListItem> = items
-                .iter()
-                .map(|d| {
-                    ListItem::new(Line::from(vec![
-                        Span::styled("󰐗 ", fg(ORANGE)),
-                        Span::styled(d.name.clone(), fg(SNOW)),
-                        Span::styled(format!("  {}", d.mac), fg(SLATE)),
-                    ]))
-                })
-                .collect();
-            render_panel(
-                frame,
-                panel_area,
-                Span::styled(" 󰐷 New Devices ", bold(ORANGE)),
-                None,
-                rows,
-                *selected,
-                items.len(),
-            );
+            if items.is_empty() {
+                let block = panel_block(Line::from(Span::styled(" 󰐷 New Devices ", bold(ORANGE))));
+                frame.render_widget(&block, panel_area);
+                let avail = block.inner(panel_area);
+                let msg_area = center(avail, 40, 1);
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "listening for devices…",
+                        fg(SLATE),
+                    )))
+                    .centered(),
+                    msg_area,
+                );
+            } else {
+                let rows: Vec<ListItem> = items
+                    .iter()
+                    .map(|d| {
+                        ListItem::new(Line::from(vec![
+                            Span::styled("󰐗 ", fg(ORANGE)),
+                            Span::styled(d.name.clone(), fg(SNOW)),
+                            Span::styled(format!("  {}", d.mac), fg(SLATE)),
+                        ]))
+                    })
+                    .collect();
+                render_panel(
+                    frame,
+                    panel_area,
+                    Line::from(Span::styled(" 󰐷 New Devices ", bold(ORANGE))),
+                    None,
+                    rows,
+                    *selected,
+                    items.len(),
+                );
+            }
         }
         _ => {
-            let rows: Vec<ListItem> = app
-                .devices
+            let vis = app.visible();
+            let rows: Vec<ListItem> = vis
                 .iter()
-                .map(|d| {
+                .map(|&idx| {
+                    let d = &app.devices[idx];
                     let (mark, name_style) = if d.connected {
                         (Span::styled("󰂱 ", fg(GREEN)), bold(SNOW))
                     } else {
@@ -145,6 +167,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
                     let mut spans = vec![mark, Span::styled(d.name.clone(), name_style)];
                     if d.connected {
                         spans.push(Span::styled(" [CONNECTED]", fg(GREEN)));
+                    }
+                    if let Some(b) = d.battery {
+                        let c = if b >= 50 {
+                            GREEN
+                        } else if b >= 20 {
+                            ORANGE
+                        } else {
+                            RED
+                        };
+                        spans.push(Span::styled(format!(" 󰁹 {b}%"), fg(c)));
                     }
                     if d.trusted {
                         spans.push(Span::styled(" 󰒘 trusted", fg(SLATE)));
@@ -161,8 +193,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
                     Span::styled("├", fg(STEEL_DIM)),
                 ])
             });
-            if rows.is_empty() {
-                let block = panel_block(Span::styled(" 󰂯 Paired Devices ", bold(BLUE)));
+            let mut title_spans = vec![Span::styled(" 󰂯 Paired Devices ", bold(BLUE))];
+            if app.filtering || !app.filter.is_empty() {
+                title_spans.push(Span::styled(
+                    format!("/{}{} ", app.filter, if app.filtering { "▏" } else { "" }),
+                    bold(ORANGE),
+                ));
+            }
+            let title = Line::from(title_spans);
+            if app.devices.is_empty() {
+                let block = panel_block(title);
                 frame.render_widget(&block, panel_area);
                 let avail = block.inner(panel_area);
                 let lines = vec![
@@ -181,11 +221,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 render_panel(
                     frame,
                     panel_area,
-                    Span::styled(" 󰂯 Paired Devices ", bold(BLUE)),
+                    title,
                     badge,
                     rows,
                     app.selected,
-                    app.devices.len(),
+                    vis.len(),
                 );
             }
         }
@@ -209,6 +249,96 @@ pub fn draw(frame: &mut Frame, app: &App) {
             let lines = fit_tail(log, content.width, content.height);
             frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), content);
         }
+    }
+
+    if let View::Details { name, text, scroll } = &mut app.view {
+        let width = 64.min(frame.area().width.saturating_sub(4)).max(20);
+        let inner_w = width.saturating_sub(2).max(1) as usize;
+        // Wrap by hand so the row count is exact — Paragraph's Wrap would
+        // silently clip whatever the (line-count-based) height missed.
+        let mut rows: Vec<String> = Vec::new();
+        for l in text.lines() {
+            let l = l.replace('\t', "  ");
+            let chars: Vec<char> = l.chars().collect();
+            if chars.is_empty() {
+                rows.push(String::new());
+            } else {
+                for chunk in chars.chunks(inner_w) {
+                    rows.push(chunk.iter().collect());
+                }
+            }
+        }
+        let height = (rows.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
+        let visible = height.saturating_sub(2);
+        let max_scroll = (rows.len() as u16).saturating_sub(visible);
+        *scroll = (*scroll).min(max_scroll);
+        let start = *scroll as usize;
+        let end = (start + visible as usize).min(rows.len());
+        let lines: Vec<Line> = rows[start..end]
+            .iter()
+            .map(|r| Line::from(Span::styled(r.clone(), fg(TEXT))))
+            .collect();
+        let mut block = Block::bordered()
+            .border_style(fg(STEEL))
+            .title(Line::from(vec![
+                Span::styled("┤ 󰋽 ", fg(STEEL)),
+                Span::styled(name.clone(), bold(BLUE)),
+                Span::styled(" ├", fg(STEEL)),
+            ]));
+        if max_scroll > 0 {
+            block = block.title_bottom(
+                Line::from(vec![
+                    Span::styled("┤", fg(STEEL)),
+                    Span::styled(format!("{}–{}/{}", start + 1, end, rows.len()), bold(ICE)),
+                    Span::styled("├", fg(STEEL)),
+                ])
+                .right_aligned(),
+            );
+        }
+        let area = center(frame.area(), width, height);
+        frame.render_widget(Clear, area);
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    if let View::PairPrompt {
+        pin,
+        passkey,
+        input,
+    } = &app.view
+    {
+        let text = if *pin {
+            vec![
+                Line::from(Span::styled("Enter PIN code for pairing:", fg(TEXT))),
+                Line::default(),
+                Line::from(Span::styled(format!("{input}▏"), bold(SNOW))),
+            ]
+        } else {
+            let shown = if passkey.is_empty() {
+                "Accept pairing request?".to_string()
+            } else {
+                format!("Passkey: {passkey}")
+            };
+            vec![
+                Line::from(Span::styled("Confirm this matches the device:", fg(TEXT))),
+                Line::from(Span::styled(shown, bold(ICE))),
+                Line::from(vec![
+                    Span::styled("y", bold(GREEN)),
+                    Span::styled(" yes    ", fg(TEXT)),
+                    Span::styled("n", bold(RED)),
+                    Span::styled(" no", fg(TEXT)),
+                ]),
+            ]
+        };
+        let area = center(frame.area(), 42, 5);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(text).centered().block(
+                Block::bordered()
+                    .border_style(fg(ORANGE))
+                    .title(Span::styled("┤ 󰌆 Pairing ├", bold(ORANGE))),
+            ),
+            area,
+        );
     }
 
     if let View::ConfirmRemove { name, mac } = &app.view {
@@ -329,23 +459,24 @@ fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
     Line::from(spans)
 }
 
-fn panel_block(title: Span<'static>) -> Block<'static> {
+fn panel_block(title: Line<'static>) -> Block<'static> {
     Block::bordered().border_style(fg(STEEL_DIM)).title(title)
 }
 
 fn render_panel(
     frame: &mut Frame,
     area: Rect,
-    title: Span<'static>,
+    title: Line<'static>,
     badge: Option<Line<'static>>,
     rows: Vec<ListItem>,
     selected: usize,
     len: usize,
 ) {
+    let pos = if len == 0 { 0 } else { selected + 1 };
     let mut block = panel_block(title).title_bottom(
         Line::from(vec![
             Span::styled("┤", fg(STEEL_DIM)),
-            Span::styled(format!("{}/{}", selected + 1, len), bold(ICE)),
+            Span::styled(format!("{pos}/{len}"), bold(ICE)),
             Span::styled("├", fg(STEEL_DIM)),
         ])
         .right_aligned(),

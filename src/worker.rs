@@ -6,10 +6,14 @@ use std::thread;
 use std::time::Duration;
 
 use crate::audio;
-use crate::bt::{self, Device, Discovered};
+use crate::bt::{self, Device, Discovered, PairEvent};
 
 pub enum Cmd {
     Refresh,
+    /// Idle-cadence relist. Unlike `Refresh` it must never touch adapter
+    /// power: it fires unattended, and re-powering a radio the user switched
+    /// off elsewhere would override their intent every few seconds.
+    AutoRefresh,
     ToggleConnect {
         mac: String,
         name: String,
@@ -28,6 +32,17 @@ pub enum Cmd {
     Remove {
         mac: String,
     },
+    ToggleProfile {
+        mac: String,
+        name: String,
+    },
+    Details {
+        mac: String,
+        name: String,
+    },
+    /// The user's answer to a pairing agent prompt ("yes"/"no"/PIN). Consumed
+    /// inside a running PairConnect; meaningless on its own.
+    PairReply(String),
 }
 
 /// Severity of a status message, so the UI colors by meaning instead of
@@ -42,6 +57,11 @@ pub enum Tone {
 
 pub enum Msg {
     Devices(Vec<Device>),
+    /// A scan began: open the (empty) picker; devices stream in as Found.
+    ScanStarted,
+    /// One device discovered mid-scan.
+    Found(Discovered),
+    /// Authoritative discovered list once the scan finished.
     ScanResults(Vec<Discovered>),
     /// A finished event for the log.
     Status(String, Tone),
@@ -49,6 +69,17 @@ pub enum Msg {
     /// "Waiting for audio sink… (3/8)"). Shown on the spinner line and
     /// replaced by the next progress message — never logged.
     Progress(String),
+    /// A pairing agent prompt: pin=true asks for text entry, otherwise it's
+    /// a yes/no passkey confirmation.
+    PairPrompt {
+        pin: bool,
+        passkey: String,
+    },
+    /// Raw device info for the details popup.
+    Details {
+        name: String,
+        text: String,
+    },
     OpDone,
 }
 
@@ -56,7 +87,12 @@ pub fn spawn(rx: Receiver<Cmd>, tx: Sender<Msg>, audio_available: bool) {
     thread::spawn(move || {
         // Sends fail only when the UI is gone; then we just stop.
         while let Ok(cmd) = rx.recv() {
-            let ok = run(cmd, &tx, audio_available);
+            // A stray reply with no pairing in progress is a no-op and must
+            // not produce an OpDone (the app doesn't count it as pending).
+            if matches!(cmd, Cmd::PairReply(_)) {
+                continue;
+            }
+            let ok = run(cmd, &rx, &tx, audio_available);
             // Refresh the list after every op; retry once so a transient
             // bluetoothd hiccup doesn't leave a stale list behind a
             // just-successful operation.
@@ -84,7 +120,7 @@ pub fn spawn(rx: Receiver<Cmd>, tx: Sender<Msg>, audio_available: bool) {
 }
 
 /// Returns false when the UI side hung up.
-fn run(cmd: Cmd, tx: &Sender<Msg>, audio_available: bool) -> bool {
+fn run(cmd: Cmd, rx: &Receiver<Cmd>, tx: &Sender<Msg>, audio_available: bool) -> bool {
     let status = |s: String, t: Tone| tx.send(Msg::Status(s, t)).is_ok();
     let progress = |s: String| {
         let _ = tx.send(Msg::Progress(s));
@@ -100,11 +136,14 @@ fn run(cmd: Cmd, tx: &Sender<Msg>, audio_available: bool) -> bool {
     };
 
     match cmd {
+        Cmd::PairReply(_) => {} // handled inside PairConnect; ignore here
         Cmd::Refresh => {
             if let Err(e) = bt::adapter_up() {
                 status(e, Tone::Err);
             }
         }
+        // The post-op relist in spawn() is the whole job.
+        Cmd::AutoRefresh => {}
         Cmd::ToggleConnect { mac, name } => {
             if let Err(e) = bt::adapter_up() {
                 status(e, Tone::Err);
@@ -148,8 +187,25 @@ fn run(cmd: Cmd, tx: &Sender<Msg>, audio_available: bool) -> bool {
                 status(e, Tone::Err);
                 return true;
             }
+            if tx.send(Msg::ScanStarted).is_err() {
+                return false;
+            }
             progress("Scanning ~10s — put the device in pairing mode…".into());
-            bt::scan(10);
+            // Seed the picker with devices already in bluetoothd's cache,
+            // then stream new finds as the scan reports them. `seen` mirrors
+            // what the picker shows, so a failed post-scan listing can still
+            // hand back a usable list instead of wedging the picker.
+            let mut seen: Vec<Discovered> = bt::discovered_unpaired().unwrap_or_default();
+            for d in &seen {
+                let _ = tx.send(Msg::Found(d.clone()));
+            }
+            bt::scan_live(10, |d| {
+                let _ = tx.send(Msg::Found(d.clone()));
+                match seen.iter_mut().find(|s| s.mac == d.mac) {
+                    Some(s) => s.name = d.name,
+                    None => seen.push(d),
+                }
+            });
             match bt::discovered_unpaired() {
                 Ok(found) => {
                     if found.is_empty() {
@@ -158,7 +214,8 @@ fn run(cmd: Cmd, tx: &Sender<Msg>, audio_available: bool) -> bool {
                     return tx.send(Msg::ScanResults(found)).is_ok();
                 }
                 Err(e) => {
-                    status(format!("Scan failed: {e}"), Tone::Err);
+                    status(format!("Scan listing failed: {e}"), Tone::Err);
+                    return tx.send(Msg::ScanResults(seen)).is_ok();
                 }
             }
         }
@@ -168,7 +225,34 @@ fn run(cmd: Cmd, tx: &Sender<Msg>, audio_available: bool) -> bool {
                 return true;
             }
             progress(format!("Pairing {name}…"));
-            if !bt::pair(&mac) {
+            // Interactive session so agent prompts (passkey/PIN) reach the
+            // user; fall back to the one-shot pair if it can't start.
+            let paired = match bt::pair_interactive(&mac, |ev| {
+                let msg = match ev {
+                    PairEvent::ConfirmPasskey(passkey) => Msg::PairPrompt {
+                        pin: false,
+                        passkey,
+                    },
+                    PairEvent::RequestPin => Msg::PairPrompt {
+                        pin: true,
+                        passkey: String::new(),
+                    },
+                };
+                if tx.send(msg).is_err() {
+                    return None;
+                }
+                loop {
+                    match rx.recv() {
+                        Ok(Cmd::PairReply(ans)) => return Some(ans),
+                        Ok(_) => continue, // gated by busy; nothing else expected
+                        Err(_) => return None,
+                    }
+                }
+            }) {
+                Ok(ok) => ok,
+                Err(_) => bt::pair(&mac),
+            };
+            if !paired {
                 status(
                     format!("Pairing failed: {name} — pick a device to retry, Esc to leave"),
                     Tone::Err,
@@ -219,6 +303,37 @@ fn run(cmd: Cmd, tx: &Sender<Msg>, audio_available: bool) -> bool {
                 status(format!("Failed to remove {mac}"), Tone::Err);
             }
         }
+        Cmd::ToggleProfile { mac, name } => {
+            if !audio_available {
+                status(
+                    "pactl not available — cannot switch profiles".into(),
+                    Tone::Err,
+                );
+                return true;
+            }
+            progress(format!("Switching audio profile of {name}…"));
+            match audio::toggle_profile(&mac) {
+                Ok(profile) => {
+                    let mode = if profile.contains("a2dp") {
+                        "A2DP (high quality)"
+                    } else {
+                        "headset (mic enabled)"
+                    };
+                    status(format!("{name}: switched to {mode}"), Tone::Ok);
+                }
+                Err(e) => {
+                    status(format!("Profile switch failed: {e}"), Tone::Err);
+                }
+            }
+        }
+        Cmd::Details { mac, name } => match bt::info_raw(&mac) {
+            Ok(text) => {
+                let _ = tx.send(Msg::Details { name, text });
+            }
+            Err(e) => {
+                status(format!("Cannot read info of {name}: {e}"), Tone::Err);
+            }
+        },
     }
     true
 }

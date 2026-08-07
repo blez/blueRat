@@ -55,7 +55,12 @@ fn main() {
 
     // Initial load also powers the adapter on if needed.
     app.begin("Loading…");
+    app.pending = 1;
     let _ = cmd_tx.send(Cmd::Refresh);
+
+    // Silent list refresh cadence while idle, so external connects and
+    // disconnects (headphones taken out of the case) show up on their own.
+    const AUTO_REFRESH: Duration = Duration::from_secs(8);
 
     let mut terminal = ratatui::init();
     while !app.quit {
@@ -64,13 +69,25 @@ fn main() {
             && key.kind == KeyEventKind::Press
             && let Some(cmd) = app.handle_key(key)
         {
+            // Pair replies are consumed inside the running pairing op and
+            // don't produce their own OpDone.
+            if !matches!(cmd, worker::Cmd::PairReply(_)) {
+                app.pending += 1;
+            }
             let _ = cmd_tx.send(cmd);
         }
         while let Ok(msg) = msg_rx.try_recv() {
             app.handle_msg(msg);
         }
         app.on_tick();
-        if let Err(e) = terminal.draw(|frame| ui::draw(frame, &app)) {
+        if app.pending == 0 && app.last_done.elapsed() >= AUTO_REFRESH {
+            // Silent relist: no busy label, keys stay live, and — unlike a
+            // user Refresh — no adapter power-on, so a radio the user turned
+            // off elsewhere stays off.
+            app.pending += 1;
+            let _ = cmd_tx.send(Cmd::AutoRefresh);
+        }
+        if let Err(e) = terminal.draw(|frame| ui::draw(frame, &mut app)) {
             bt::kill_running_child();
             ratatui::restore();
             eprintln!("draw error: {e}");

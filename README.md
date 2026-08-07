@@ -8,12 +8,17 @@ just the tools you already have, with a fast keyboard-driven interface on top.
 
 ## Features
 
-- Paired-device list with live connected / trusted state
+- Paired-device list with live connected / trusted state, battery level,
+  connected devices first — auto-refreshed every few seconds
 - Enter toggles connect / disconnect
-- Scan & pair new devices (10s scan, picker of discovered devices)
+- Live scan & pair: discovered devices stream into the picker in real time,
+  including devices that need passkey confirmation or PIN entry
 - Trust / untrust and remove (with confirmation)
 - Automatic audio routing: a freshly connected audio device becomes the
   default sink and existing streams move to it (PipeWire and PulseAudio)
+- Audio profile toggle: switch a headset between A2DP (high quality) and
+  HFP/HSP (microphone enabled)
+- Fuzzy filter, device details popup, banner-style event log
 - All blocking operations run on a worker thread — the UI never freezes
 
 ## Keys
@@ -22,11 +27,14 @@ just the tools you already have, with a fast keyboard-driven interface on top.
 |------------------------|---------------------------------------------------------------|
 | `j` / `k` / arrows     | navigate                                                      |
 | `Enter`                | connect / disconnect (in scan picker: pair + trust + connect) |
-| `s`                    | scan & pair new device                                        |
+| `s`                    | scan & pair new device (live picker)                          |
+| `a`                    | toggle audio profile (A2DP ↔ headset/mic)                     |
+| `i`                    | device details popup (`j`/`k` scroll)                         |
+| `/`                    | fuzzy filter the device list                                  |
 | `t`                    | toggle trust                                                  |
 | `x` / `Del`            | remove device (confirmation)                                  |
 | `r`                    | refresh                                                       |
-| `q` / `Esc` / `Ctrl-C` | quit / back                                                   |
+| `q` / `Esc` / `Ctrl-C` | quit / back (Esc clears the filter first)                     |
 
 ## Requirements
 
@@ -41,7 +49,3 @@ make install          # install binary, icon and .desktop to ~/.local
 make PREFIX=/usr/local install   # system-wide instead
 make test             # unit tests
 ```
-
-`assets/icon.png` is the icon master (512px, transparent background);
-`assets/icon-256.png` is the launcher-size derivative that `make install`
-places into the hicolor theme.

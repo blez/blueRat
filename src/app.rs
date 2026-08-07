@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::bt::{Device, Discovered};
+use crate::bt::{self, Device, Discovered};
 use crate::worker::{Cmd, Msg, Tone};
 
 /// Info/Ok log entries disappear this long after being pushed. Warn/Err
@@ -25,10 +25,22 @@ pub enum View {
         mac: String,
         name: String,
     },
+    Details {
+        name: String,
+        text: String,
+        /// First wrapped row shown; the renderer clamps it to the content.
+        scroll: u16,
+    },
+    PairPrompt {
+        pin: bool,
+        passkey: String,
+        input: String,
+    },
 }
 
 pub struct App {
     pub devices: Vec<Device>,
+    /// Selection index into the *visible* (filtered) device list.
     pub selected: usize,
     pub view: View,
     pub busy: Option<String>,
@@ -36,6 +48,19 @@ pub struct App {
     pub progress: Option<String>,
     /// Banner-console-style event log: newest last.
     pub log: Vec<(String, Tone, Instant)>,
+    /// Fuzzy filter over device names; empty = show all.
+    pub filter: String,
+    /// True while the user is typing the filter query.
+    pub filtering: bool,
+    /// Operations sent to the worker that haven't OpDone'd yet. Includes
+    /// silent auto-refreshes, which carry no busy label.
+    pub pending: u32,
+    /// When the worker last went idle — drives the auto-refresh cadence.
+    pub last_done: Instant,
+    /// One-shot: drop the next `Msg::ScanResults`. Set when the user closes
+    /// the picker (or queues a pair) mid-scan, so the scan's final list can't
+    /// yank them back into a view they already left.
+    pub ignore_scan_results: bool,
     pub tick: u64,
     pub quit: bool,
 }
@@ -49,6 +74,11 @@ impl App {
             busy: None,
             progress: None,
             log: Vec::new(),
+            filter: String::new(),
+            filtering: false,
+            pending: 0,
+            last_done: Instant::now(),
+            ignore_scan_results: false,
             tick: 0,
             quit: false,
         }
@@ -62,45 +92,131 @@ impl App {
     }
 
     /// Append a finished event to the log. Live progress goes through
-    /// `Msg::Progress` instead and never lands here.
+    /// `Msg::Progress` instead and never lands here. A repeat of the newest
+    /// entry (e.g. the same error from consecutive auto-refreshes) only
+    /// refreshes its timestamp.
     pub fn push_log(&mut self, s: String, tone: Tone) {
+        if let Some(last) = self.log.last_mut()
+            && last.0 == s
+            && last.1 == tone
+        {
+            last.2 = Instant::now();
+            return;
+        }
         self.log.push((s, tone, Instant::now()));
         if self.log.len() > LOG_MAX {
             self.log.remove(0);
         }
     }
 
-    /// Mark an operation as started. The user is acting again, so warnings
-    /// and errors that outlived their TTL stop being pinned.
+    /// Mark a user-visible operation as started. The user is acting again,
+    /// so warnings and errors that outlived their TTL stop being pinned.
     pub fn begin(&mut self, label: &str) {
         self.busy = Some(label.to_string());
         self.progress = None;
         self.log.retain(|(_, _, at)| at.elapsed() <= LOG_TTL);
     }
 
+    /// Indices into `devices` that pass the current filter.
+    pub fn visible(&self) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return (0..self.devices.len()).collect();
+        }
+        self.devices
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| fuzzy_match(&d.name, &self.filter))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The device under the cursor, honoring the filter.
+    pub fn current(&self) -> Option<&Device> {
+        self.visible().get(self.selected).map(|&i| &self.devices[i])
+    }
+
     pub fn handle_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Devices(devices) => {
-                // Keep the cursor on the same device across refreshes.
-                let anchor = self.devices.get(self.selected).map(|d| d.mac.clone());
+            Msg::Devices(mut devices) => {
+                // Connected devices first, then alphabetical; keep the cursor
+                // on the same device across refreshes.
+                devices.sort_by_cached_key(|d| (!d.connected, d.name.to_lowercase()));
+                let anchor = self.current().map(|d| d.mac.clone());
                 self.devices = devices;
+                let vis = self.visible();
                 self.selected = anchor
-                    .and_then(|mac| self.devices.iter().position(|d| d.mac == mac))
-                    .unwrap_or(0);
-                if !self.devices.is_empty() {
-                    self.selected = self.selected.min(self.devices.len() - 1);
+                    .and_then(|mac| vis.iter().position(|&i| self.devices[i].mac == mac))
+                    .unwrap_or(0)
+                    .min(vis.len().saturating_sub(1));
+            }
+            Msg::ScanStarted => {
+                self.ignore_scan_results = false;
+                self.view = View::ScanResults {
+                    items: Vec::new(),
+                    selected: 0,
+                };
+            }
+            Msg::Found(d) => {
+                if let View::ScanResults { items, .. } = &mut self.view {
+                    match items.iter_mut().find(|i| i.mac == d.mac) {
+                        Some(existing) => existing.name = d.name,
+                        None => items.push(d),
+                    }
                 }
             }
-            Msg::ScanResults(items) => {
-                if !items.is_empty() {
-                    self.view = View::ScanResults { items, selected: 0 };
+            Msg::ScanResults(new_items) => {
+                // The user closed the picker (or already picked a device)
+                // mid-scan — the scan's final list must not reopen it.
+                if self.ignore_scan_results {
+                    self.ignore_scan_results = false;
+                    return;
+                }
+                if !new_items.is_empty() {
+                    // The final list arrives in bluetoothd cache order, not
+                    // stream order — re-anchor the cursor by MAC so it stays
+                    // on the device the user highlighted.
+                    let anchor = match &self.view {
+                        View::ScanResults { items, selected } => {
+                            items.get(*selected).map(|d| d.mac.clone())
+                        }
+                        _ => None,
+                    };
+                    let selected = anchor
+                        .and_then(|mac| new_items.iter().position(|d| d.mac == mac))
+                        .unwrap_or(0);
+                    self.view = View::ScanResults {
+                        items: new_items,
+                        selected,
+                    };
+                } else if matches!(&self.view, View::ScanResults { items, .. } if items.is_empty())
+                {
+                    // Empty scan, empty picker: nothing to choose from.
+                    self.view = View::DeviceList;
                 }
             }
             Msg::Status(s, tone) => self.push_log(s, tone),
             Msg::Progress(s) => self.progress = Some(s),
+            Msg::PairPrompt { pin, passkey } => {
+                self.view = View::PairPrompt {
+                    pin,
+                    passkey,
+                    input: String::new(),
+                };
+            }
+            Msg::Details { name, text } => {
+                self.view = View::Details {
+                    name,
+                    text,
+                    scroll: 0,
+                };
+            }
             Msg::OpDone => {
-                self.busy = None;
-                self.progress = None;
+                self.pending = self.pending.saturating_sub(1);
+                if self.pending == 0 {
+                    self.busy = None;
+                    self.progress = None;
+                    self.last_done = Instant::now();
+                }
             }
         }
     }
@@ -115,16 +231,108 @@ impl App {
             return None;
         }
 
-        // While an operation runs, allow only navigation, back, and quit.
-        // q/Esc must mean "back" in sub-views even here — the scan picker is
-        // shown while the post-scan refresh is still running, and quitting
-        // the whole app from it would contradict the visible hints.
+        // Pairing prompts answer while busy (the pairing op is running).
+        if let View::PairPrompt { pin, input, .. } = &mut self.view {
+            let pin = *pin;
+            match key.code {
+                KeyCode::Esc => {
+                    self.view = View::DeviceList;
+                    // "no" is a valid decline for yes/no prompts, but a PIN
+                    // prompt would take it as the literal PIN — an empty
+                    // reply tells the worker to abort the session instead.
+                    let ans = if pin { String::new() } else { "no".into() };
+                    return Some(Cmd::PairReply(ans));
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y') if !pin => {
+                    self.view = View::DeviceList;
+                    return Some(Cmd::PairReply("yes".into()));
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') if !pin => {
+                    self.view = View::DeviceList;
+                    return Some(Cmd::PairReply("no".into()));
+                }
+                KeyCode::Enter if pin => {
+                    // An empty submit would read as a cancel — require input.
+                    if input.is_empty() {
+                        return None;
+                    }
+                    let ans = input.clone();
+                    self.view = View::DeviceList;
+                    return Some(Cmd::PairReply(ans));
+                }
+                KeyCode::Backspace if pin => {
+                    input.pop();
+                }
+                KeyCode::Char(c) if pin && c.is_ascii_alphanumeric() => {
+                    input.push(c);
+                }
+                _ => {}
+            }
+            return None;
+        }
+
+        // Filter input mode captures typing.
+        if self.filtering {
+            match key.code {
+                KeyCode::Esc => {
+                    self.filtering = false;
+                    self.filter.clear();
+                    self.selected = 0;
+                }
+                KeyCode::Enter => self.filtering = false,
+                KeyCode::Backspace => {
+                    self.filter.pop();
+                    self.selected = 0;
+                }
+                KeyCode::Char(c) => {
+                    self.filter.push(c);
+                    self.selected = 0;
+                }
+                _ => {}
+            }
+            return None;
+        }
+
+        // While an operation runs, allow navigation, back, quit — and Enter
+        // in the scan picker, so streamed-in devices are pairable the moment
+        // they appear instead of only after the 10s scan ends.
         if self.busy.is_some() {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => match self.view {
-                    View::DeviceList => self.quit = true,
+                    View::DeviceList => {
+                        // Same semantics as when idle: Esc peels the filter
+                        // before it means quit.
+                        if key.code == KeyCode::Esc && !self.filter.is_empty() {
+                            self.filter.clear();
+                            self.selected = 0;
+                        } else {
+                            self.quit = true;
+                        }
+                    }
+                    View::ScanResults { .. } => {
+                        self.ignore_scan_results = true;
+                        self.view = View::DeviceList;
+                    }
                     _ => self.view = View::DeviceList,
                 },
+                KeyCode::Enter => {
+                    if let View::ScanResults { items, selected } = &self.view
+                        && let Some(d) = items.get(*selected)
+                    {
+                        let cmd = Cmd::PairConnect {
+                            mac: d.mac.clone(),
+                            name: d.name.clone(),
+                            others: items.clone(),
+                        };
+                        self.ignore_scan_results = true;
+                        self.view = View::DeviceList;
+                        self.begin("Pairing…");
+                        // Cut the running scan short; the worker then moves
+                        // straight on to the queued pair.
+                        bt::kill_running_child();
+                        return Some(cmd);
+                    }
+                }
                 KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
                 KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
                 _ => {}
@@ -134,15 +342,25 @@ impl App {
 
         match &mut self.view {
             View::DeviceList => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+                KeyCode::Char('q') => self.quit = true,
+                KeyCode::Esc => {
+                    // Esc peels the filter first, then quits.
+                    if self.filter.is_empty() {
+                        self.quit = true;
+                    } else {
+                        self.filter.clear();
+                        self.selected = 0;
+                    }
+                }
                 KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
                 KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
                 KeyCode::Char('g') => self.selected = 0,
                 KeyCode::Char('G') => {
-                    self.selected = self.devices.len().saturating_sub(1);
+                    self.selected = self.visible().len().saturating_sub(1);
                 }
+                KeyCode::Char('/') => self.filtering = true,
                 KeyCode::Enter => {
-                    let d = self.devices.get(self.selected)?;
+                    let d = self.current()?;
                     let cmd = Cmd::ToggleConnect {
                         mac: d.mac.clone(),
                         name: d.name.clone(),
@@ -156,13 +374,31 @@ impl App {
                     return Some(Cmd::Scan);
                 }
                 KeyCode::Char('t') => {
-                    let d = self.devices.get(self.selected)?;
+                    let d = self.current()?;
                     let cmd = Cmd::ToggleTrust { mac: d.mac.clone() };
                     self.begin("Updating trust…");
                     return Some(cmd);
                 }
+                KeyCode::Char('a') => {
+                    let d = self.current()?;
+                    let cmd = Cmd::ToggleProfile {
+                        mac: d.mac.clone(),
+                        name: d.name.clone(),
+                    };
+                    self.begin("Switching audio profile…");
+                    return Some(cmd);
+                }
+                KeyCode::Char('i') => {
+                    let d = self.current()?;
+                    let cmd = Cmd::Details {
+                        mac: d.mac.clone(),
+                        name: d.name.clone(),
+                    };
+                    self.begin("Loading info…");
+                    return Some(cmd);
+                }
                 KeyCode::Char('x') | KeyCode::Delete => {
-                    let d = self.devices.get(self.selected)?;
+                    let d = self.current()?;
                     self.view = View::ConfirmRemove {
                         mac: d.mac.clone(),
                         name: d.name.clone(),
@@ -175,7 +411,12 @@ impl App {
                 _ => {}
             },
             View::ScanResults { items, selected } => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => self.view = View::DeviceList,
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    // A straggling final scan list must not reopen the
+                    // picker the user just closed.
+                    self.ignore_scan_results = true;
+                    self.view = View::DeviceList;
+                }
                 KeyCode::Char('j') | KeyCode::Down => {
                     *selected = (*selected + 1).min(items.len().saturating_sub(1));
                 }
@@ -207,6 +448,19 @@ impl App {
                 // Default is No, like the script's `[y/N]`.
                 _ => self.view = View::DeviceList,
             },
+            View::Details { scroll, .. } => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('i') | KeyCode::Enter => {
+                    self.view = View::DeviceList;
+                }
+                // The renderer clamps to the actual wrapped content, which
+                // only it knows (depends on the popup width).
+                KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
+                KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                KeyCode::Char('g') => *scroll = 0,
+                KeyCode::Char('G') => *scroll = u16::MAX,
+                _ => {}
+            },
+            View::PairPrompt { .. } => unreachable!("handled above"),
         }
         None
     }
@@ -214,7 +468,7 @@ impl App {
     fn move_sel(&mut self, delta: i64) {
         let len = match &self.view {
             View::ScanResults { items, .. } => items.len(),
-            _ => self.devices.len(),
+            _ => self.visible().len(),
         };
         if len == 0 {
             return;
@@ -224,5 +478,167 @@ impl App {
             _ => &mut self.selected,
         };
         *sel = (*sel as i64 + delta).clamp(0, len as i64 - 1) as usize;
+    }
+}
+
+/// Case-insensitive subsequence match, fzf-style: every needle char must
+/// appear in the haystack in order.
+fn fuzzy_match(haystack: &str, needle: &str) -> bool {
+    let hay = haystack.to_lowercase();
+    let mut it = hay.chars();
+    needle
+        .to_lowercase()
+        .chars()
+        .all(|n| it.by_ref().any(|h| h == n))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn app_with_devices() -> App {
+        let mut app = App::new();
+        app.handle_msg(Msg::Devices(vec![Device {
+            mac: "AA:BB:CC:DD:EE:FF".into(),
+            name: "Fake Headphones".into(),
+            connected: true,
+            trusted: true,
+            battery: Some(80),
+        }]));
+        app
+    }
+
+    #[test]
+    fn fuzzy_matches_subsequences() {
+        assert!(fuzzy_match("WH-1000XM4", "wh4"));
+        assert!(fuzzy_match("JBL Flip 5", "jblf5"));
+        assert!(fuzzy_match("Anything", ""));
+        assert!(!fuzzy_match("WH-1000XM4", "xm5"));
+        assert!(!fuzzy_match("abc", "cba"));
+    }
+
+    #[test]
+    fn slash_enters_filter_mode_and_enter_leaves_it() {
+        let mut app = app_with_devices();
+        assert!(app.handle_key(key(KeyCode::Char('/'))).is_none());
+        assert!(app.filtering);
+        app.handle_key(key(KeyCode::Char('f')));
+        assert_eq!(app.filter, "f");
+        assert_eq!(app.visible().len(), 1);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.filtering);
+        assert_eq!(app.filter, "f");
+        // Esc clears the filter before quitting.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.quit);
+        assert!(app.filter.is_empty());
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn filter_with_no_matches_blocks_actions_safely() {
+        let mut app = app_with_devices();
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Char('z')));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.visible().len(), 0);
+        assert!(app.handle_key(key(KeyCode::Enter)).is_none());
+        assert!(app.busy.is_none());
+    }
+
+    fn disc(mac: &str, name: &str) -> Discovered {
+        Discovered {
+            mac: mac.into(),
+            name: name.into(),
+        }
+    }
+
+    fn scanning_app() -> App {
+        let mut app = app_with_devices();
+        app.begin("Scanning ~10s…");
+        app.pending = 1;
+        app.handle_msg(Msg::ScanStarted);
+        app.handle_msg(Msg::Found(disc("11:11:11:11:11:11", "Buds A")));
+        app.handle_msg(Msg::Found(disc("22:22:22:22:22:22", "Buds B")));
+        app
+    }
+
+    #[test]
+    fn scan_results_reanchor_selection_by_mac() {
+        let mut app = scanning_app();
+        // Cursor onto "Buds B" (index 1 in stream order).
+        app.handle_key(key(KeyCode::Char('j')));
+        // Authoritative list arrives reordered: B is now index 0.
+        app.handle_msg(Msg::ScanResults(vec![
+            disc("22:22:22:22:22:22", "Buds B"),
+            disc("11:11:11:11:11:11", "Buds A"),
+        ]));
+        match &app.view {
+            View::ScanResults { items, selected } => {
+                assert_eq!(items[*selected].mac, "22:22:22:22:22:22");
+            }
+            _ => panic!("picker should stay open"),
+        }
+    }
+
+    #[test]
+    fn dismissed_picker_is_not_reopened_by_final_results() {
+        let mut app = scanning_app();
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.view, View::DeviceList));
+        app.handle_msg(Msg::ScanResults(vec![disc("11:11:11:11:11:11", "Buds A")]));
+        assert!(matches!(app.view, View::DeviceList));
+        // The suppression is one-shot: a pair-failure reopen still works.
+        app.handle_msg(Msg::ScanResults(vec![disc("11:11:11:11:11:11", "Buds A")]));
+        assert!(matches!(app.view, View::ScanResults { .. }));
+    }
+
+    #[test]
+    fn enter_pairs_mid_scan_and_suppresses_the_final_list() {
+        let mut app = scanning_app();
+        let cmd = app.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(cmd, Some(Cmd::PairConnect { ref mac, .. }) if mac == "11:11:11:11:11:11")
+        );
+        assert!(matches!(app.view, View::DeviceList));
+        // The scan's own final list is dropped; the pairing runs next.
+        app.handle_msg(Msg::ScanResults(vec![disc("11:11:11:11:11:11", "Buds A")]));
+        assert!(matches!(app.view, View::DeviceList));
+    }
+
+    #[test]
+    fn esc_while_busy_clears_filter_before_quitting() {
+        let mut app = app_with_devices();
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Char('f')));
+        app.handle_key(key(KeyCode::Enter));
+        app.begin("Updating trust…");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.quit);
+        assert!(app.filter.is_empty());
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn esc_on_pin_prompt_sends_cancel_not_a_pin() {
+        let mut app = app_with_devices();
+        app.begin("Pairing…");
+        app.handle_msg(Msg::PairPrompt {
+            pin: true,
+            passkey: String::new(),
+        });
+        // Empty submit is a no-op, not an accidental cancel.
+        assert!(app.handle_key(key(KeyCode::Enter)).is_none());
+        assert!(matches!(app.view, View::PairPrompt { .. }));
+        match app.handle_key(key(KeyCode::Esc)) {
+            Some(Cmd::PairReply(ans)) => assert!(ans.is_empty()),
+            other => panic!("expected empty PairReply, got {:?}", other.is_some()),
+        }
     }
 }

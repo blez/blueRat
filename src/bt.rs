@@ -1,5 +1,6 @@
 //! Thin wrappers around `bluetoothctl`, mirroring blue-tui.sh.
 
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -9,6 +10,9 @@ pub struct Device {
     pub name: String,
     pub connected: bool,
     pub trusted: bool,
+    /// Battery percentage, when the device reports one (usually only while
+    /// connected).
+    pub battery: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,13 +22,23 @@ pub struct Discovered {
 }
 
 /// Live state of one device, from `bluetoothctl info`.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Info {
     pub connected: bool,
     pub trusted: bool,
     /// Offers an A2DP Audio Sink profile (headphones/speakers) — the only
     /// devices worth waiting on for audio routing.
     pub audio: bool,
+    pub battery: Option<u8>,
+}
+
+/// An agent prompt raised during interactive pairing.
+pub enum PairEvent {
+    /// "Confirm passkey NNNNNN (yes/no)" — the string is the passkey, empty
+    /// for generic yes/no authorization prompts.
+    ConfirmPasskey(String),
+    /// "Enter PIN code:" / "Enter passkey:".
+    RequestPin,
 }
 
 /// PID of the bluetoothctl invocation currently blocking the worker, if any.
@@ -127,11 +141,16 @@ pub fn adapter_up() -> Result<(), String> {
 /// Live state for a MAC. Err means the query itself failed — callers must
 /// not treat that as "disconnected".
 pub fn info(mac: &str) -> Result<Info, String> {
+    Ok(parse_info(&info_raw(mac)?))
+}
+
+/// Raw `bluetoothctl info` output for the details popup.
+pub fn info_raw(mac: &str) -> Result<String, String> {
     let (ok, out, err) = btctl(&["info", mac]);
     if !ok {
         return Err(error_text(&[&err, &out]));
     }
-    Ok(parse_info(&out))
+    Ok(out)
 }
 
 fn parse_info(out: &str) -> Info {
@@ -139,7 +158,15 @@ fn parse_info(out: &str) -> Info {
         connected: out.contains("Connected: yes"),
         trusted: out.contains("Trusted: yes"),
         audio: out.contains("Audio Sink"),
+        battery: parse_battery(out),
     }
+}
+
+/// "Battery Percentage: 0x50 (80)" → 80.
+fn parse_battery(out: &str) -> Option<u8> {
+    let line = out.lines().find(|l| l.contains("Battery Percentage"))?;
+    let inside = line.rsplit('(').next()?.split(')').next()?;
+    inside.trim().parse().ok()
 }
 
 pub fn paired_devices() -> Result<Vec<Device>, String> {
@@ -151,7 +178,7 @@ pub fn paired_devices() -> Result<Vec<Device>, String> {
     // Two whole-list queries beat one `info` subprocess per device.
     let (okc, conn, _) = btctl(&["devices", "Connected"]);
     let (okt, trust, _) = btctl(&["devices", "Trusted"]);
-    if okc && okt {
+    let mut devices: Vec<Device> = if okc && okt {
         let connected: Vec<String> = conn
             .lines()
             .filter_map(parse_device_line)
@@ -162,45 +189,273 @@ pub fn paired_devices() -> Result<Vec<Device>, String> {
             .filter_map(parse_device_line)
             .map(|(mac, _)| mac)
             .collect();
-        return Ok(pairs
+        pairs
             .into_iter()
             .map(|(mac, name)| Device {
                 connected: connected.contains(&mac),
                 trusted: trusted.contains(&mac),
                 mac,
                 name,
+                battery: None,
             })
-            .collect());
-    }
+            .collect()
+    } else {
+        // Older bluez without `devices <filter>`: one info call per device.
+        pairs
+            .into_iter()
+            .map(|(mac, name)| {
+                let i = info(&mac).unwrap_or_default();
+                Device {
+                    mac,
+                    name,
+                    connected: i.connected,
+                    trusted: i.trusted,
+                    battery: i.battery,
+                }
+            })
+            .collect()
+    };
 
-    // Older bluez without `devices <filter>`: one info call per device.
-    Ok(pairs
-        .into_iter()
-        .map(|(mac, name)| {
-            let i = info(&mac).unwrap_or_default();
-            Device {
-                mac,
-                name,
-                connected: i.connected,
-                trusted: i.trusted,
+    // Battery is only reported while connected; one extra info call per
+    // connected device (usually 0-2) is cheap.
+    for d in devices.iter_mut().filter(|d| d.connected) {
+        if d.battery.is_none()
+            && let Ok(i) = info(&d.mac)
+        {
+            d.battery = i.battery;
+        }
+    }
+    Ok(devices)
+}
+
+/// Live scan: spawns `bluetoothctl --timeout <secs> scan on` and reports
+/// discovered unpaired named devices as their lines stream in. Blocks until
+/// the scan ends.
+pub fn scan_live(secs: u32, mut on_found: impl FnMut(Discovered)) {
+    let paired = paired_macs().unwrap_or_default();
+
+    let child = Command::new("bluetoothctl")
+        .args(["--timeout", &secs.to_string(), "scan", "on"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else { return };
+    CHILD_PID.store(child.id(), Ordering::SeqCst);
+    if let Some(stdout) = child.stdout.take() {
+        for line in BufReader::new(stdout).lines() {
+            // Device names are arbitrary bytes; one undecodable line must
+            // not end the whole scan.
+            let Ok(line) = line else { continue };
+            if let Some((mac, name)) = parse_scan_event(&line)
+                && discoverable(&paired, &mac, &name)
+            {
+                on_found(Discovered { mac, name });
             }
-        })
+        }
+    }
+    let _ = child.wait();
+    CHILD_PID.store(0, Ordering::SeqCst);
+}
+
+/// "[NEW] Device <mac> <name>" or "[CHG] Device <mac> Name: <name>" →
+/// (mac, name). ANSI escapes and control characters are stripped first.
+fn parse_scan_event(line: &str) -> Option<(String, String)> {
+    let clean = strip_ansi(line);
+    let clean = clean.trim();
+    let is_new = clean.contains("[NEW]");
+    let is_chg = clean.contains("[CHG]");
+    if !is_new && !is_chg {
+        return None;
+    }
+    // Anchor on the "] Device " that follows the [NEW]/[CHG] tag — a plain
+    // split on "Device " would also fire inside names like "My Device Pro".
+    let rest = &clean[clean.find("] Device ")? + "] Device ".len()..];
+    let (mac, tail) = rest.split_once(' ')?;
+    if is_chg {
+        let name = tail.strip_prefix("Name: ")?;
+        return Some((mac.to_string(), name.to_string()));
+    }
+    Some((mac.to_string(), tail.to_string()))
+}
+
+/// Remove ANSI escape sequences and stray control characters.
+fn strip_ansi(s: &str) -> String {
+    let mut carry = s.to_string();
+    strip_ansi_stream(&mut carry)
+}
+
+/// Streaming `strip_ansi`: consumes `carry`, returns the cleaned text, and
+/// leaves a trailing incomplete escape sequence back in `carry` so a code
+/// split across two reads still gets stripped once the rest arrives.
+fn strip_ansi_stream(carry: &mut String) -> String {
+    let s = std::mem::take(carry);
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek() {
+                // Skip CSI-style sequences up to the final letter.
+                Some((_, '[')) => {
+                    chars.next();
+                    let mut terminated = false;
+                    for (_, e) in chars.by_ref() {
+                        if e.is_ascii_alphabetic() {
+                            terminated = true;
+                            break;
+                        }
+                    }
+                    if !terminated {
+                        *carry = s[i..].to_string();
+                        break;
+                    }
+                }
+                // Input ends right at the ESC — sequence may continue in the
+                // next chunk.
+                None => {
+                    *carry = s[i..].to_string();
+                    break;
+                }
+                Some(_) => {} // lone ESC before ordinary text: drop it
+            }
+        } else if !c.is_control() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Interactive pairing session that can answer BlueZ agent prompts (passkey
+/// confirmation, PIN entry) via the `respond` callback. Returns Ok(success);
+/// Err means the session could not be started (caller may fall back to the
+/// one-shot `pair`).
+pub fn pair_interactive(
+    mac: &str,
+    mut respond: impl FnMut(PairEvent) -> Option<String>,
+) -> Result<bool, String> {
+    let mut child = Command::new("bluetoothctl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    CHILD_PID.store(child.id(), Ordering::SeqCst);
+    let mut stdin = child.stdin.take().ok_or("no stdin")?;
+    let mut stdout = child.stdout.take().ok_or("no stdout")?;
+    let _ = writeln!(stdin, "pair {mac}");
+
+    // `clean` accumulates ANSI-stripped output; each chunk is stripped once
+    // (a code split across reads waits in `carry`) instead of re-stripping
+    // the whole session on every read. Answered prompts clear it so the same
+    // prompt can't match twice.
+    let mut clean = String::new();
+    let mut carry = String::new();
+    let mut buf = [0u8; 512];
+    let mut success = false;
+    let mut cancelled = false;
+    loop {
+        let n = match stdout.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        carry.push_str(&String::from_utf8_lossy(&buf[..n]));
+        clean.push_str(&strip_ansi_stream(&mut carry));
+        if clean.contains("Pairing successful") || clean.contains("AlreadyExists") {
+            success = true;
+            break;
+        }
+        if ["Failed to pair", "Authentication", "not available"]
+            .iter()
+            .any(|m| clean.contains(m))
+        {
+            break;
+        }
+        if clean.contains("Confirm passkey") && clean.contains("(yes/no)") {
+            let pk = extract_passkey(&clean).unwrap_or_default();
+            let ans = respond(PairEvent::ConfirmPasskey(pk)).unwrap_or_else(|| "no".into());
+            let _ = writeln!(stdin, "{ans}");
+            clean.clear();
+        } else if clean.contains("(yes/no)") {
+            let ans =
+                respond(PairEvent::ConfirmPasskey(String::new())).unwrap_or_else(|| "no".into());
+            let _ = writeln!(stdin, "{ans}");
+            clean.clear();
+        } else if clean.contains("Enter PIN code") || clean.contains("Enter passkey") {
+            match respond(PairEvent::RequestPin) {
+                Some(ans) if !ans.is_empty() => {
+                    let _ = writeln!(stdin, "{ans}");
+                    clean.clear();
+                }
+                // Cancelled. bluetoothctl is sitting at an agent prompt that
+                // would swallow "quit" as the PIN, so end the session by
+                // force instead.
+                _ => {
+                    cancelled = true;
+                    break;
+                }
+            }
+        }
+        // A pathological session (endless [CHG] chatter, never a prompt)
+        // must not grow the buffer forever; the markers we look for always
+        // sit in the recent tail.
+        if clean.len() > 16 * 1024 {
+            let target = clean.len() - 4096;
+            let cut = match clean[..target].rfind('\n') {
+                Some(i) => i + 1,
+                None => {
+                    let mut c = target;
+                    while !clean.is_char_boundary(c) {
+                        c -= 1;
+                    }
+                    c
+                }
+            };
+            clean.drain(..cut);
+        }
+    }
+    if cancelled {
+        let _ = child.kill();
+    } else {
+        let _ = writeln!(stdin, "quit");
+    }
+    // Close both pipes before reaping, so a still-chatty bluetoothctl can't
+    // block forever on a full stdout pipe we no longer read.
+    drop(stdin);
+    drop(stdout);
+    let _ = child.wait();
+    CHILD_PID.store(0, Ordering::SeqCst);
+    Ok(success)
+}
+
+/// Digits following "Confirm passkey".
+fn extract_passkey(text: &str) -> Option<String> {
+    let after = text.split("Confirm passkey").nth(1)?;
+    let digits: String = after
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    (!digits.is_empty()).then_some(digits)
+}
+
+/// MACs of all paired devices.
+fn paired_macs() -> Result<Vec<String>, String> {
+    Ok(list_paired_output()?
+        .lines()
+        .filter_map(parse_device_line)
+        .map(|(mac, _)| mac)
         .collect())
 }
 
-/// Blocking scan for ~`secs` seconds. Exit code is ignored (the script does `|| true`).
-pub fn scan(secs: u32) {
-    btctl(&["--timeout", &secs.to_string(), "scan", "on"]);
+/// Worth offering in the scan picker: not already paired, and carrying a
+/// real name rather than its own MAC.
+fn discoverable(paired: &[String], mac: &str, name: &str) -> bool {
+    !paired.iter().any(|p| p == mac) && !name_is_mac(name, mac)
 }
 
 /// Discovered devices that aren't paired and have a real name.
 pub fn discovered_unpaired() -> Result<Vec<Discovered>, String> {
-    let paired: Vec<String> = list_paired_output()?
-        .lines()
-        .filter_map(parse_device_line)
-        .map(|(mac, _)| mac)
-        .collect();
-
+    let paired = paired_macs()?;
     let (ok, all, err) = btctl(&["devices"]);
     if !ok {
         return Err(error_text(&[&err, &all]));
@@ -208,7 +463,7 @@ pub fn discovered_unpaired() -> Result<Vec<Discovered>, String> {
     Ok(all
         .lines()
         .filter_map(parse_device_line)
-        .filter(|(mac, name)| !paired.contains(mac) && !name_is_mac(name, mac))
+        .filter(|(mac, name)| discoverable(&paired, mac, name))
         .map(|(mac, name)| Discovered { mac, name })
         .collect())
 }
@@ -315,15 +570,72 @@ mod tests {
                    \tPaired: yes\n\
                    \tTrusted: yes\n\
                    \tConnected: no\n\
-                   \tUUID: Audio Sink                (0000110b-0000-1000-8000-00805f9b34fb)\n";
+                   \tUUID: Audio Sink                (0000110b-0000-1000-8000-00805f9b34fb)\n\
+                   \tBattery Percentage: 0x50 (80)\n";
         assert_eq!(
             parse_info(out),
             Info {
                 connected: false,
                 trusted: true,
-                audio: true
+                audio: true,
+                battery: Some(80),
             }
         );
         assert_eq!(parse_info(""), Info::default());
+    }
+
+    #[test]
+    fn parses_scan_events() {
+        assert_eq!(
+            parse_scan_event("[NEW] Device AA:BB:CC:DD:EE:FF JBL Flip 5"),
+            Some(("AA:BB:CC:DD:EE:FF".into(), "JBL Flip 5".into()))
+        );
+        assert_eq!(
+            parse_scan_event("\x1b[0;92m[NEW]\x1b[0m Device AA:BB:CC:DD:EE:FF Buds"),
+            Some(("AA:BB:CC:DD:EE:FF".into(), "Buds".into()))
+        );
+        assert_eq!(
+            parse_scan_event("[CHG] Device AA:BB:CC:DD:EE:FF Name: Real Name"),
+            Some(("AA:BB:CC:DD:EE:FF".into(), "Real Name".into()))
+        );
+        assert_eq!(
+            parse_scan_event("[CHG] Device AA:BB:CC:DD:EE:FF RSSI: -60"),
+            None
+        );
+        assert_eq!(parse_scan_event("Discovery started"), None);
+    }
+
+    #[test]
+    fn scan_event_keeps_device_in_name() {
+        assert_eq!(
+            parse_scan_event("[NEW] Device AA:BB:CC:DD:EE:FF My Device Pro"),
+            Some(("AA:BB:CC:DD:EE:FF".into(), "My Device Pro".into()))
+        );
+        assert_eq!(
+            parse_scan_event("[CHG] Device AA:BB:CC:DD:EE:FF Name: My Device Pro"),
+            Some(("AA:BB:CC:DD:EE:FF".into(), "My Device Pro".into()))
+        );
+    }
+
+    #[test]
+    fn strip_ansi_stream_carries_split_escape() {
+        let mut carry = String::new();
+        carry.push_str("foo\x1b[0");
+        let mut out = strip_ansi_stream(&mut carry);
+        assert_eq!(out, "foo");
+        assert_eq!(carry, "\x1b[0");
+        carry.push_str("1mbar");
+        out.push_str(&strip_ansi_stream(&mut carry));
+        assert_eq!(out, "foobar");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn extracts_passkey() {
+        assert_eq!(
+            extract_passkey("[agent] Confirm passkey 461829 (yes/no):"),
+            Some("461829".into())
+        );
+        assert_eq!(extract_passkey("Confirm passkey (yes/no)"), None);
     }
 }

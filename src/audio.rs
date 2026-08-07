@@ -74,6 +74,83 @@ pub fn route_audio(mac: &str, progress: impl Fn(String)) -> bool {
     true
 }
 
+/// Toggle the device's card between its A2DP (high quality) and headset
+/// (mic-enabled) profiles. Returns the name of the newly active profile.
+pub fn toggle_profile(mac: &str) -> Result<String, String> {
+    let mac_us = mac.replace(':', "_");
+    let (_, cards) = pactl(&["list", "short", "cards"]);
+    let card = cards
+        .lines()
+        .filter_map(|l| field(l, 1))
+        .find(|c| sink_matches(c, &mac_us))
+        .map(str::to_string)
+        .ok_or("no audio card for this device (is it connected?)")?;
+
+    let (_, out) = pactl(&["list", "cards"]);
+    let (active, available) = parse_card_profiles(&out, &card);
+    let active = active.ok_or("could not determine active profile")?;
+
+    let want_headset = active.contains("a2dp");
+    let target = available
+        .iter()
+        .find(|p| {
+            if want_headset {
+                p.contains("headset") || p.contains("handsfree") || p.contains("hfp")
+            } else {
+                p.contains("a2dp")
+            }
+        })
+        .ok_or_else(|| {
+            if want_headset {
+                "device has no headset/mic profile".to_string()
+            } else {
+                "device has no A2DP profile".to_string()
+            }
+        })?;
+
+    if !pactl(&["set-card-profile", &card, target]).0 {
+        return Err(format!("failed to switch profile to {target}"));
+    }
+    Ok(target.clone())
+}
+
+/// From `pactl list cards` output, extract (active profile, available
+/// profiles) for the named card.
+fn parse_card_profiles(out: &str, card: &str) -> (Option<String>, Vec<String>) {
+    let mut in_card = false;
+    let mut in_profiles = false;
+    let mut active = None;
+    let mut available = Vec::new();
+    for line in out.lines() {
+        let t = line.trim();
+        if let Some(name) = t.strip_prefix("Name: ") {
+            in_card = name == card;
+            in_profiles = false;
+            continue;
+        }
+        if !in_card {
+            continue;
+        }
+        if t.starts_with("Profiles:") {
+            in_profiles = true;
+            continue;
+        }
+        if let Some(p) = t.strip_prefix("Active Profile: ") {
+            active = Some(p.to_string());
+            in_profiles = false;
+            continue;
+        }
+        if in_profiles
+            && let Some((name, rest)) = t.split_once(':')
+            && rest.contains("available: yes")
+            && name != "off"
+        {
+            available.push(name.to_string());
+        }
+    }
+    (active, available)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +177,26 @@ mod tests {
             "alsa_output.pci-0000_00_1f.3.analog-stereo",
             "AA_BB_CC_DD_EE_FF"
         ));
+    }
+
+    #[test]
+    fn parses_card_profiles() {
+        let out = "Card #52\n\
+                   \tName: bluez_card.AA_BB_CC_DD_EE_FF\n\
+                   \tDriver: module-bluez5-device.c\n\
+                   \tProfiles:\n\
+                   \t\ta2dp-sink: High Fidelity Playback (A2DP Sink) (sinks: 1, sources: 0, priority: 40, available: yes)\n\
+                   \t\theadset-head-unit: Headset Head Unit (HSP/HFP) (sinks: 1, sources: 1, priority: 30, available: yes)\n\
+                   \t\toff: Off (sinks: 0, sources: 0, priority: 0, available: yes)\n\
+                   \tActive Profile: a2dp-sink\n\
+                   Card #53\n\
+                   \tName: alsa_card.pci-0000_00_1f.3\n";
+        let (active, avail) = parse_card_profiles(out, "bluez_card.AA_BB_CC_DD_EE_FF");
+        assert_eq!(active.as_deref(), Some("a2dp-sink"));
+        assert_eq!(avail, vec!["a2dp-sink", "headset-head-unit"]);
+        let (none, empty) = parse_card_profiles(out, "bluez_card.other");
+        assert_eq!(none, None);
+        assert!(empty.is_empty());
     }
 
     #[test]
