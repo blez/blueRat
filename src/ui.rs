@@ -10,7 +10,7 @@ use ratatui::layout::{Constraint, Flex, Layout, Margin, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    Block, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState, Wrap,
 };
 
@@ -39,6 +39,13 @@ const SIDE_LOG_BREAKPOINT: u16 = 90;
 const SIDE_LOG_RATIO: u32 = 35; // percent of total width
 const SIDE_LOG_MIN: u16 = 34;
 const CONTENT_MIN: u16 = 40;
+
+/// Widest the details popup may grow, as a percentage of the terminal. It
+/// shrinks to fit its content, so this only bites when a line is genuinely
+/// longer than the screen can comfortably show.
+const DETAILS_MAX_RATIO: u32 = 90;
+/// Columns of breathing room between the details text and its border.
+const DETAILS_PAD: u16 = 1;
 
 /// Where the event log renders this frame.
 enum LogSlot {
@@ -266,13 +273,30 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if let View::Details { name, text, scroll } = &mut app.view {
-        let width = 64.min(frame.area().width.saturating_sub(4)).max(20);
-        let inner_w = width.saturating_sub(2).max(1) as usize;
+        let src: Vec<String> = text.lines().map(|l| l.replace('\t', "  ")).collect();
+        // Size to the content rather than a fixed column count: `bluetoothctl
+        // info` runs to ~72 columns, and wrapping every UUID line doubled the
+        // popup's height for nothing. The 90% cap keeps it a popup on narrow
+        // terminals; fitting the content keeps it from becoming a mostly-empty
+        // banner on wide ones.
+        let longest = src
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(u16::MAX as usize - 4) as u16;
+        // "┤ 󰋽 " + name + " ├"
+        let title_w = name.chars().count().min(u16::MAX as usize - 8) as u16 + 6;
+        let screen_w = frame.area().width;
+        let cap = ((screen_w as u32 * DETAILS_MAX_RATIO / 100) as u16).clamp(20, screen_w.max(1));
+        // Borders plus the padding the block will eat on both sides.
+        let chrome = 2 + 2 * DETAILS_PAD;
+        let width = (longest.max(title_w) + chrome).clamp(20.min(cap), cap);
+        let inner_w = width.saturating_sub(chrome).max(1) as usize;
         // Wrap by hand so the row count is exact — Paragraph's Wrap would
         // silently clip whatever the (line-count-based) height missed.
         let mut rows: Vec<String> = Vec::new();
-        for l in text.lines() {
-            let l = l.replace('\t', "  ");
+        for l in src {
             let chars: Vec<char> = l.chars().collect();
             if chars.is_empty() {
                 rows.push(String::new());
@@ -294,6 +318,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .collect();
         let mut block = Block::bordered()
             .border_style(fg(STEEL))
+            .padding(Padding::horizontal(DETAILS_PAD))
             .title(Line::from(vec![
                 Span::styled("┤ 󰋽 ", fg(STEEL)),
                 Span::styled(name.clone(), bold(BLUE)),
