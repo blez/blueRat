@@ -144,6 +144,16 @@ fn run(cmd: Cmd, rx: &Receiver<Cmd>, tx: &Sender<Msg>, audio_available: bool) ->
             ));
             return;
         }
+        // An LE-Audio-only device cannot grow a sink on a host whose kernel
+        // refuses ISO sockets. Say so now rather than after an 8s poll that
+        // can only fail.
+        if kind == AudioKind::LeAudioOnly && !diag::iso_socket_available() {
+            let _ = tx.send(Msg::Status(
+                diag::routing_failure_hint(mac, kind),
+                Tone::Warn,
+            ));
+            return;
+        }
         if audio::route_audio(mac, |s| {
             let _ = tx.send(Msg::Progress(s));
         }) {
@@ -217,21 +227,32 @@ fn run(cmd: Cmd, rx: &Receiver<Cmd>, tx: &Sender<Msg>, audio_available: bool) ->
             // what the picker shows, so a failed post-scan listing can still
             // hand back a usable list instead of wedging the picker.
             let mut seen: Vec<Discovered> = bt::discovered_unpaired().unwrap_or_default();
+            // Address kinds decide which addresses belong to one physical
+            // device, so they must be known before the picker groups rows.
+            bt::fill_addr_kinds(&mut seen);
             for d in &seen {
                 let _ = tx.send(Msg::Found(d.clone()));
             }
-            bt::scan_live(10, |d| {
-                let _ = tx.send(Msg::Found(d.clone()));
+            bt::scan_live(10, |mut d| {
                 match seen.iter_mut().find(|s| s.mac == d.mac) {
-                    Some(s) => s.name = d.name,
-                    None => seen.push(d),
+                    Some(s) => {
+                        s.name = d.name.clone();
+                        d.addr = s.addr;
+                    }
+                    None => {
+                        // One info call per newly seen address, not per event.
+                        bt::fill_addr_kinds(std::slice::from_mut(&mut d));
+                        seen.push(d.clone());
+                    }
                 }
+                let _ = tx.send(Msg::Found(d));
             });
             match bt::discovered_unpaired() {
-                Ok(found) => {
+                Ok(mut found) => {
                     if found.is_empty() {
                         status("Nothing new found".into(), Tone::Info);
                     }
+                    bt::fill_addr_kinds(&mut found);
                     return tx.send(Msg::ScanResults(found)).is_ok();
                 }
                 Err(e) => {
@@ -256,6 +277,10 @@ fn run(cmd: Cmd, rx: &Receiver<Cmd>, tx: &Sender<Msg>, audio_available: bool) ->
             let ranked = bt::rank_candidates(&candidates);
             let multi = ranked.len() > 1;
 
+            // Set when the *user* declines a prompt (or the UI goes away), as
+            // opposed to an address refusing us. Without the distinction, one
+            // Esc would re-raise the same prompt for every remaining address.
+            let mut aborted = false;
             let mut paired_mac = None;
             for (i, mac) in ranked.iter().enumerate() {
                 if multi {
@@ -279,13 +304,25 @@ fn run(cmd: Cmd, rx: &Receiver<Cmd>, tx: &Sender<Msg>, audio_available: bool) ->
                         },
                     };
                     if tx.send(msg).is_err() {
+                        aborted = true;
                         return None;
                     }
                     loop {
                         match rx.recv() {
-                            Ok(Cmd::PairReply(ans)) => return Some(ans),
+                            Ok(Cmd::PairReply(ans)) => {
+                                // Esc sends "" for a PIN and "no" for a
+                                // yes/no prompt; either means "stop", not
+                                // "this address said no".
+                                if ans.is_empty() || ans == "no" {
+                                    aborted = true;
+                                }
+                                return Some(ans);
+                            }
                             Ok(_) => continue, // gated by busy; nothing else expected
-                            Err(_) => return None,
+                            Err(_) => {
+                                aborted = true;
+                                return None;
+                            }
                         }
                     }
                 }) {
@@ -294,6 +331,9 @@ fn run(cmd: Cmd, rx: &Receiver<Cmd>, tx: &Sender<Msg>, audio_available: bool) ->
                 };
                 if ok {
                     paired_mac = Some(mac.clone());
+                    break;
+                }
+                if aborted {
                     break;
                 }
                 // A device that advertises several addresses usually only
@@ -308,10 +348,14 @@ fn run(cmd: Cmd, rx: &Receiver<Cmd>, tx: &Sender<Msg>, audio_available: bool) ->
             }
 
             let Some(mac) = paired_mac else {
-                status(
-                    format!("Pairing failed: {name} — pick a device to retry, Esc to leave"),
-                    Tone::Err,
-                );
+                if aborted {
+                    status(format!("Pairing cancelled: {name}"), Tone::Info);
+                } else {
+                    status(
+                        format!("Pairing failed: {name} — pick a device to retry, Esc to leave"),
+                        Tone::Err,
+                    );
+                }
                 // Reopen the picker with the same scan results so the user
                 // doesn't have to sit through another 10s scan.
                 return tx.send(Msg::ScanResults(others)).is_ok();
@@ -370,11 +414,9 @@ fn run(cmd: Cmd, rx: &Receiver<Cmd>, tx: &Sender<Msg>, audio_available: bool) ->
             progress(format!("Switching audio profile of {name}…"));
             match audio::toggle_profile(&mac) {
                 Ok(profile) => {
-                    let mode = if profile.contains("a2dp") {
-                        "A2DP (high quality)"
-                    } else {
-                        "headset (mic enabled)"
-                    };
+                    // Label from the profile that actually took effect —
+                    // "a2dp" alone would call a BAP switch a headset switch.
+                    let mode = audio::profile_label(&profile);
                     status(format!("{name}: switched to {mode}"), Tone::Ok);
                 }
                 Err(e) => {

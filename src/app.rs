@@ -169,11 +169,19 @@ impl App {
                 };
             }
             Msg::Found(d) => {
-                if let View::ScanResults { items, .. } = &mut self.view {
+                if let View::ScanResults { items, selected } = &mut self.view {
                     match items.iter_mut().find(|i| i.mac == d.mac) {
-                        Some(existing) => existing.name = d.name,
+                        Some(existing) => {
+                            existing.name = d.name;
+                            existing.addr = d.addr;
+                        }
                         None => items.push(d),
                     }
+                    // A rename can merge two rows, shrinking the grouped list
+                    // under the cursor; an out-of-range selection renders as a
+                    // "3/2" counter with no highlight and a dead Enter.
+                    let rows = bt::group_discovered(items).len();
+                    *selected = (*selected).min(rows.saturating_sub(1));
                 }
             }
             Msg::ScanResults(new_items) => {
@@ -584,10 +592,21 @@ mod tests {
         assert!(app.busy.is_none());
     }
 
+    /// A device's stable (classic) address.
     fn disc(mac: &str, name: &str) -> Discovered {
         Discovered {
             mac: mac.into(),
             name: name.into(),
+            addr: bt::AddrKind::Public,
+        }
+    }
+
+    /// One of the rotating LE addresses the same unit also advertises.
+    fn disc_le(mac: &str, name: &str) -> Discovered {
+        Discovered {
+            mac: mac.into(),
+            name: name.into(),
+            addr: bt::AddrKind::Random,
         }
     }
 
@@ -652,8 +671,8 @@ mod tests {
         app.pending = 1;
         app.handle_msg(Msg::ScanStarted);
         app.handle_msg(Msg::Found(disc("40:7E:72:67:25:64", "Buds3 Pro")));
-        app.handle_msg(Msg::Found(disc("7C:AF:C1:52:DC:A8", "Buds3 Pro")));
-        app.handle_msg(Msg::Found(disc("A0:B0:BD:F3:BA:41", "Buds3 Pro")));
+        app.handle_msg(Msg::Found(disc_le("7C:AF:C1:52:DC:A8", "Buds3 Pro")));
+        app.handle_msg(Msg::Found(disc_le("A0:B0:BD:F3:BA:41", "Buds3 Pro")));
         app.handle_msg(Msg::Found(disc("78:C1:1D:12:D4:96", "Phone")));
 
         let groups = app.scan_groups();
@@ -680,7 +699,7 @@ mod tests {
         app.pending = 1;
         app.handle_msg(Msg::ScanStarted);
         app.handle_msg(Msg::Found(disc("40:7E:72:67:25:64", "Buds3 Pro")));
-        app.handle_msg(Msg::Found(disc("7C:AF:C1:52:DC:A8", "Buds3 Pro")));
+        app.handle_msg(Msg::Found(disc_le("7C:AF:C1:52:DC:A8", "Buds3 Pro")));
         app.handle_msg(Msg::Found(disc("78:C1:1D:12:D4:96", "Phone")));
 
         app.handle_key(key(KeyCode::Char('j')));

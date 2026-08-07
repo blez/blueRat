@@ -28,6 +28,15 @@ fn have(bin: &str) -> bool {
     )
 }
 
+/// Six colon- or dash-separated hex octets.
+fn looks_like_mac(s: &str) -> bool {
+    let parts: Vec<&str> = s.split([':', '-']).collect();
+    parts.len() == 6
+        && parts
+            .iter()
+            .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 const USAGE: &str = "\
 bluerat — TUI Bluetooth manager for Linux
 
@@ -52,7 +61,19 @@ fn main() {
                     eprintln!("error: 'bluetoothctl' not found — install the 'bluez' package");
                     exit(1);
                 }
-                let mac = std::env::args().nth(2);
+                // Without this, `--doctor --help` diagnoses a device called
+                // "--help" instead of printing usage.
+                let mac = match std::env::args().nth(2) {
+                    Some(a) if a.starts_with('-') => {
+                        eprintln!("error: --doctor takes a MAC address, not '{a}'\n\n{USAGE}");
+                        exit(2);
+                    }
+                    Some(a) if !looks_like_mac(&a) => {
+                        eprintln!("error: '{a}' is not a MAC address (expected AA:BB:CC:DD:EE:FF)");
+                        exit(2);
+                    }
+                    other => other,
+                };
                 print!(
                     "{}",
                     diag::report(mac.as_deref().map(|m| (m, "selected device")))

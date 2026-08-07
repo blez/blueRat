@@ -120,6 +120,30 @@ fn is_headset_profile(p: &str) -> bool {
     p.contains("headset") || p.contains("handsfree") || p.contains("hfp")
 }
 
+/// Best playback profile on a card that offers several. A2DP wins over LE
+/// Audio: classic audio works on any host, while BAP needs kernel ISO support
+/// that many systems lack — picking whichever `pactl` happened to print first
+/// could silently strand the user on a transport that produces no sound.
+fn pick_media_profile(available: &[String]) -> Option<&String> {
+    available
+        .iter()
+        .find(|p| p.contains("a2dp"))
+        .or_else(|| available.iter().find(|p| p.contains("bap")))
+}
+
+/// How a card profile reads in a status message.
+pub fn profile_label(p: &str) -> String {
+    if p.contains("a2dp") {
+        "A2DP (high quality)".into()
+    } else if p.contains("bap") {
+        "LE Audio (high quality)".into()
+    } else if is_headset_profile(p) {
+        "headset (mic enabled)".into()
+    } else {
+        p.to_string()
+    }
+}
+
 /// Toggle the device's card between its high-quality playback profile
 /// (A2DP or LE Audio BAP) and its headset (mic-enabled) profile. Returns the
 /// name of the newly active profile.
@@ -131,22 +155,18 @@ pub fn toggle_profile(mac: &str) -> Result<String, String> {
     let active = active.ok_or("could not determine active profile")?;
 
     let want_headset = is_media_profile(&active);
-    let target = available
-        .iter()
-        .find(|p| {
-            if want_headset {
-                is_headset_profile(p)
-            } else {
-                is_media_profile(p)
-            }
-        })
-        .ok_or_else(|| {
-            if want_headset {
-                "device has no headset/mic profile".to_string()
-            } else {
-                "device has no high-quality playback profile".to_string()
-            }
-        })?;
+    let target = if want_headset {
+        available.iter().find(|p| is_headset_profile(p))
+    } else {
+        pick_media_profile(&available)
+    }
+    .ok_or_else(|| {
+        if want_headset {
+            "device has no headset/mic profile".to_string()
+        } else {
+            "device has no high-quality playback profile".to_string()
+        }
+    })?;
 
     if !pactl(&["set-card-profile", &card, target]).0 {
         return Err(format!("failed to switch profile to {target}"));
@@ -262,6 +282,28 @@ mod tests {
         assert_eq!(active.as_deref(), Some("bap-sink"));
         assert!(is_media_profile(active.as_deref().unwrap()));
         assert!(avail.iter().any(|p| is_headset_profile(p)));
+    }
+
+    #[test]
+    fn prefers_a2dp_over_le_audio() {
+        // A dual-mode card must not be moved onto BAP just because pactl
+        // listed it first — LE Audio needs host support A2DP does not.
+        let avail = vec!["bap-sink".to_string(), "a2dp-sink".to_string()];
+        assert_eq!(pick_media_profile(&avail).unwrap(), "a2dp-sink");
+        let only_bap = vec!["bap-sink".to_string()];
+        assert_eq!(pick_media_profile(&only_bap).unwrap(), "bap-sink");
+        assert_eq!(pick_media_profile(&[]), None);
+    }
+
+    #[test]
+    fn labels_profiles_by_transport() {
+        assert_eq!(profile_label("bap-sink"), "LE Audio (high quality)");
+        assert_eq!(profile_label("a2dp-sink"), "A2DP (high quality)");
+        assert_eq!(
+            profile_label("headset-head-unit-msbc"),
+            "headset (mic enabled)"
+        );
+        assert_eq!(profile_label("weird-thing"), "weird-thing");
     }
 
     #[test]

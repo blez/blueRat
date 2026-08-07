@@ -7,21 +7,33 @@
 //! does the audio backend exist, can this kernel carry LE Audio at all, and
 //! finally what does this one device actually offer.
 
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::audio;
 use crate::bt::{self, AddrKind, AudioKind};
 
-/// Where distributions install PipeWire's bluez backend. Its absence is a
-/// silent killer: PipeWire runs fine and simply never builds a bluez card.
-const SPA_BLUEZ_PATHS: [&str; 5] = [
-    "/usr/lib/x86_64-linux-gnu/spa-0.2/bluez5/libspa-bluez5.so",
-    "/usr/lib/aarch64-linux-gnu/spa-0.2/bluez5/libspa-bluez5.so",
-    "/usr/lib/spa-0.2/bluez5/libspa-bluez5.so",
-    "/usr/lib64/spa-0.2/bluez5/libspa-bluez5.so",
-    "/usr/local/lib/spa-0.2/bluez5/libspa-bluez5.so",
+/// Library roots to search for PipeWire's bluez backend. Every immediate
+/// subdirectory is searched too, which covers all multiarch triplets without
+/// enumerating them. Its absence is a silent killer: PipeWire runs fine and
+/// simply never builds a bluez card.
+const LIB_ROOTS: [&str; 5] = [
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/local/lib",
+    "/usr/local/lib64",
+    "/run/current-system/sw/lib",
 ];
+
+/// Path of the plugin relative to a library root.
+const SPA_BLUEZ_SUFFIX: &str = "spa-0.2/bluez5/libspa-bluez5.so";
+
+/// A wedged bluetoothd (D-Bus not answering) makes `bluetoothctl show` block
+/// for ~20 minutes. A diagnostic that hangs is worse than one that reports the
+/// hang, so every probe here is bounded.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const AF_BLUETOOTH: i32 = 31;
 const SOCK_SEQPACKET: i32 = 5;
@@ -58,17 +70,87 @@ fn have(bin: &str) -> bool {
         .is_ok()
 }
 
-fn spa_bluez_plugin() -> Option<&'static str> {
-    SPA_BLUEZ_PATHS.into_iter().find(|p| Path::new(p).exists())
+/// Run a command, killing it if it outlives `PROBE_TIMEOUT`. Returns None if
+/// it could not be started, timed out, or exited non-zero. Output is small
+/// enough here that the pipe cannot fill while we poll.
+fn probe(bin: &str, args: &[&str]) -> Option<String> {
+    probe_within(bin, args, PROBE_TIMEOUT)
+}
+
+fn probe_within(bin: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let out: Output = child.wait_with_output().ok()?;
+                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            // Timed out, or the wait itself failed.
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// Search the library roots (and their immediate subdirectories, which is
+/// where multiarch triplets live) for PipeWire's bluez plugin. A hardcoded
+/// path list reports "not installed" on any layout it doesn't know about,
+/// which is exactly the wrong answer from a diagnostic.
+fn spa_bluez_plugin() -> Option<String> {
+    // PipeWire's own override wins when it is set.
+    if let Ok(dir) = std::env::var("SPA_PLUGIN_DIR") {
+        let p = Path::new(&dir).join("bluez5/libspa-bluez5.so");
+        if p.exists() {
+            return Some(p.display().to_string());
+        }
+    }
+    for root in LIB_ROOTS {
+        let root = Path::new(root);
+        let direct = root.join(SPA_BLUEZ_SUFFIX);
+        if direct.exists() {
+            return Some(direct.display().to_string());
+        }
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        let mut found: Option<PathBuf> = None;
+        for e in entries.flatten() {
+            let candidate = e.path().join(SPA_BLUEZ_SUFFIX);
+            if candidate.exists() {
+                found = Some(candidate);
+                break;
+            }
+        }
+        if let Some(p) = found {
+            return Some(p.display().to_string());
+        }
+    }
+    None
 }
 
 /// Does PulseAudio proper have its bluez module loaded?
 fn pulse_bluez_module() -> bool {
-    Command::new("pactl")
-        .args(["list", "short", "modules"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("bluez5"))
-        .unwrap_or(false)
+    probe("pactl", &["list", "short", "modules"]).is_some_and(|o| o.contains("bluez5"))
+}
+
+/// Is a bluez card present right now? The one unambiguous positive: whatever
+/// the file layout, a card can only exist if the backend is working.
+fn bluez_card_present() -> bool {
+    probe("pactl", &["list", "short", "cards"]).is_some_and(|o| o.contains("bluez"))
 }
 
 /// One line of the report: a status glyph, a label, a value, and an optional
@@ -128,12 +210,49 @@ impl Check {
     }
 }
 
-fn host_checks() -> Vec<Check> {
+/// Everything the host report needs from the outside world. Gathering is
+/// separated from judging so the report can be exercised without a Bluetooth
+/// stack, a sound server, or a 20-minute wait on a wedged daemon.
+struct HostProbe {
+    /// `bluetoothctl show` output; None when it failed or timed out.
+    show: Option<String>,
+    pactl: bool,
+    server: Option<String>,
+    bluez_card: bool,
+    spa_plugin: Option<String>,
+    pulse_module: bool,
+    iso: bool,
+}
+
+fn probe_host() -> HostProbe {
+    let show = probe("bluetoothctl", &["show"]);
+    let pactl = have("pactl");
+    // Skip the sound-server questions entirely when pactl is missing: every
+    // one of them would just be a slower way of saying so.
+    let (server, bluez_card, pulse_module) = if pactl {
+        (audio::server_name(), bluez_card_present(), {
+            // Only meaningful as a fallback; probing costs a subprocess.
+            pulse_bluez_module()
+        })
+    } else {
+        (None, false, false)
+    };
+    HostProbe {
+        show,
+        pactl,
+        server,
+        bluez_card,
+        spa_plugin: spa_bluez_plugin(),
+        pulse_module,
+        iso: iso_socket_available(),
+    }
+}
+
+fn host_checks(p: &HostProbe) -> Vec<Check> {
     let mut checks = Vec::new();
 
-    match Command::new("bluetoothctl").arg("show").output() {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
+    match &p.show {
+        Some(text) => {
             checks.push(Check::ok("bluetoothd", "running"));
             if text.contains("Powered: yes") {
                 checks.push(Check::ok("adapter", "powered on"));
@@ -145,57 +264,64 @@ fn host_checks() -> Vec<Check> {
                 ));
             }
         }
-        _ => checks.push(Check::fail(
+        None => checks.push(Check::fail(
             "bluetoothd",
             "not reachable",
-            "Start it: systemctl start bluetooth",
+            "Start it: systemctl start bluetooth\n\
+             (a daemon that is up but not answering D-Bus looks the same here)",
         )),
     }
 
-    if !have("pactl") {
+    if !p.pactl {
         checks.push(Check::fail(
             "sound server",
             "pactl not found",
             "Install pulseaudio-utils (or pipewire-pulse). Without it\n\
              blueRat cannot route audio at all.",
         ));
-        return checks;
-    }
-
-    let server = audio::server_name();
-    match &server {
-        Some(name) => checks.push(Check::ok("sound server", name.clone())),
-        None => checks.push(Check::fail(
-            "sound server",
-            "not responding",
-            "pactl is installed but no server answered. Is the user\n\
-             session running (systemctl --user status pipewire)?",
-        )),
-    }
-
-    // The bluez backend is what turns a connected device into a card+sink.
-    let pipewire = server.as_deref().is_some_and(|s| s.contains("PipeWire"));
-    match spa_bluez_plugin() {
-        Some(path) => checks.push(Check::ok("bluez audio backend", path)),
-        None if pipewire => checks.push(Check::warn(
-            "bluez audio backend",
-            "libspa-bluez5.so not found",
-            "PipeWire is running but its Bluetooth plugin is missing from\n\
-             the usual paths. Install libspa-0.2-bluetooth (Debian/Ubuntu),\n\
-             pipewire-audio (Fedora) or pipewire (Arch).",
-        )),
-        None if pulse_bluez_module() => {
-            checks.push(Check::ok("bluez audio backend", "module-bluez5 loaded"))
+    } else {
+        match &p.server {
+            Some(name) => checks.push(Check::ok("sound server", name.clone())),
+            None => checks.push(Check::fail(
+                "sound server",
+                "not responding",
+                "pactl is installed but no server answered. Is the user\n\
+                 session running (systemctl --user status pipewire)?",
+            )),
         }
-        None => checks.push(Check::warn(
-            "bluez audio backend",
-            "not detected",
-            "No bluez audio module found. Bluetooth devices will connect\n\
-             but never produce a sink.",
-        )),
+
+        // The bluez backend is what turns a connected device into a card+sink.
+        // An existing card proves it works whatever the file layout says.
+        let pipewire = p.server.as_deref().is_some_and(|s| s.contains("PipeWire"));
+        if p.bluez_card {
+            checks.push(Check::ok(
+                "bluez audio backend",
+                "active (bluez card present)",
+            ));
+        } else if p.pulse_module {
+            checks.push(Check::ok("bluez audio backend", "module-bluez5 loaded"));
+        } else if let Some(path) = &p.spa_plugin {
+            checks.push(Check::ok("bluez audio backend", path.clone()));
+        } else if pipewire {
+            checks.push(Check::warn(
+                "bluez audio backend",
+                "libspa-bluez5.so not found",
+                "PipeWire is running but its Bluetooth plugin was not found.\n\
+                 Install libspa-0.2-bluetooth (Debian/Ubuntu),\n\
+                 pipewire-audio (Fedora) or pipewire (Arch).\n\
+                 If it is installed somewhere unusual, set SPA_PLUGIN_DIR.",
+            ));
+        } else {
+            checks.push(Check::warn(
+                "bluez audio backend",
+                "not detected",
+                "No bluez audio module found. Bluetooth devices will connect\n\
+                 but never produce a sink.",
+            ));
+        }
     }
 
-    if iso_socket_available() {
+    if p.iso {
         checks.push(Check::ok("LE Audio (ISO)", "supported"));
     } else {
         checks.push(Check::warn(
@@ -296,7 +422,7 @@ fn device_checks(mac: &str) -> Vec<Check> {
 /// host-wide checks.
 pub fn report(device: Option<(&str, &str)>) -> String {
     let mut out = String::from("Host\n");
-    for c in host_checks() {
+    for c in host_checks(&probe_host()) {
         c.render(&mut out);
     }
     if let Some((mac, name)) = device {
@@ -314,6 +440,13 @@ pub fn routing_failure_hint(mac: &str, audio: AudioKind) -> String {
     if audio == AudioKind::LeAudioOnly && !iso_socket_available() {
         return "no audio sink: device is LE-Audio-only and this system has no \
                 ISO support — pair its classic address instead (d for details)"
+            .into();
+    }
+    // The sink exists, so routing failed at the last step rather than never
+    // having anything to route to — a very different thing to go fix.
+    if audio::sink_for(mac).is_some() {
+        return "sink exists but could not be made the default output — another \
+                tool may be managing it (d for details)"
             .into();
     }
     if audio.routable() && audio::card_for(mac).is_none() {
@@ -335,11 +468,110 @@ mod tests {
         let _ = iso_socket_available();
     }
 
+    fn healthy_probe() -> HostProbe {
+        HostProbe {
+            show: Some("Controller 00:11:22:33:44:55\n\tPowered: yes\n".into()),
+            pactl: true,
+            server: Some("PulseAudio (on PipeWire 1.0.5)".into()),
+            bluez_card: true,
+            spa_plugin: None,
+            pulse_module: false,
+            iso: true,
+        }
+    }
+
+    fn render(checks: Vec<Check>) -> String {
+        let mut s = String::new();
+        for c in checks {
+            c.render(&mut s);
+        }
+        s
+    }
+
     #[test]
-    fn report_includes_host_section() {
-        let text = report(None);
-        assert!(text.starts_with("Host\n"));
+    fn healthy_host_reports_every_section() {
+        let text = render(host_checks(&healthy_probe()));
+        assert!(text.contains("✓ bluetoothd"));
+        assert!(text.contains("✓ adapter"));
+        assert!(text.contains("✓ sound server"));
+        assert!(text.contains("✓ bluez audio backend"));
+        assert!(text.contains("✓ LE Audio (ISO)"));
+    }
+
+    #[test]
+    fn missing_pactl_still_reports_the_kernel_check() {
+        // The early return this replaced skipped every later check, so a host
+        // without pactl never learned anything about its kernel.
+        let probe = HostProbe {
+            pactl: false,
+            server: None,
+            bluez_card: false,
+            iso: false,
+            ..healthy_probe()
+        };
+        let text = render(host_checks(&probe));
+        assert!(text.contains("✗ sound server"));
+        assert!(text.contains("pactl not found"));
         assert!(text.contains("LE Audio (ISO)"));
+    }
+
+    #[test]
+    fn unreachable_daemon_is_a_failure_not_a_hang() {
+        let probe = HostProbe {
+            show: None,
+            ..healthy_probe()
+        };
+        let text = render(host_checks(&probe));
+        assert!(text.contains("✗ bluetoothd"));
+        assert!(text.contains("not reachable"));
+    }
+
+    #[test]
+    fn an_existing_card_outranks_a_missing_plugin_file() {
+        // The plugin lives somewhere the path search doesn't know, but a card
+        // exists — the backend demonstrably works, so don't tell the user to
+        // install what they already have.
+        let probe = HostProbe {
+            spa_plugin: None,
+            bluez_card: true,
+            ..healthy_probe()
+        };
+        let text = render(host_checks(&probe));
+        assert!(text.contains("✓ bluez audio backend"));
+        assert!(!text.contains("libspa-0.2-bluetooth"));
+    }
+
+    #[test]
+    fn pipewire_without_any_backend_says_what_to_install() {
+        let probe = HostProbe {
+            bluez_card: false,
+            spa_plugin: None,
+            pulse_module: false,
+            ..healthy_probe()
+        };
+        let text = render(host_checks(&probe));
+        assert!(text.contains("! bluez audio backend"));
+        assert!(text.contains("libspa-0.2-bluetooth"));
+    }
+
+    #[test]
+    fn probe_gives_up_instead_of_blocking() {
+        // `sleep 30` stands in for a wedged bluetoothd, which really does
+        // block `bluetoothctl show` for ~20 minutes.
+        let start = Instant::now();
+        assert_eq!(
+            probe_within("sleep", &["30"], Duration::from_millis(200)),
+            None
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn probe_returns_output_of_a_fast_command() {
+        let out = probe("echo", &["hello"]).expect("echo should succeed");
+        assert_eq!(out.trim(), "hello");
+        // A non-zero exit is "no answer", not an empty answer.
+        assert_eq!(probe("false", &[]), None);
     }
 
     #[test]

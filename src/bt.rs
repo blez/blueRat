@@ -19,6 +19,10 @@ pub struct Device {
 pub struct Discovered {
     pub mac: String,
     pub name: String,
+    /// Public or random, which decides whether this address may be folded
+    /// into a same-named group. Filled in by `fill_addr_kinds`; `Unknown`
+    /// until then, and treated as stable (its own row) when it stays that way.
+    pub addr: AddrKind,
 }
 
 /// One physical device as offered in the scan picker. Modern earbuds announce
@@ -206,13 +210,16 @@ fn parse_info(out: &str) -> Info {
     }
 }
 
-/// LE Audio service UUIDs. bluetoothctl truncates long names to a fixed
-/// column ("Published Audio Capabil.."), so these are matched as prefixes.
-const LE_AUDIO_UUIDS: [&str; 3] = [
-    "Audio Stream Control",
-    "Published Audio Capabil",
-    "Common Audio",
-];
+/// Services an LE Audio *sink* hosts. A Unicast Server (earbuds, speaker)
+/// publishes both: ASCS to carry the stream and PACS to describe what it can
+/// play. bluetoothctl truncates long names to a fixed column
+/// ("Published Audio Capabil.."), so these are matched as prefixes.
+///
+/// Requiring both matters: phones and watches advertise LE Audio *client*
+/// services (Common Audio, Call Control, Media Control) without being able to
+/// play anything, and treating those as audio sinks makes every connect wait
+/// out the sink poll for nothing.
+const LE_AUDIO_SINK_UUIDS: [&str; 2] = ["Audio Stream Control", "Published Audio Capabil"];
 
 /// A2DP beats LE Audio when a device offers both: classic audio needs no
 /// experimental kernel support, so it is the transport that actually works.
@@ -220,7 +227,7 @@ fn parse_audio_kind(out: &str) -> AudioKind {
     if out.contains("Audio Sink") {
         return AudioKind::Classic;
     }
-    if LE_AUDIO_UUIDS.iter().any(|u| out.contains(u)) {
+    if LE_AUDIO_SINK_UUIDS.iter().all(|u| out.contains(u)) {
         return AudioKind::LeAudioOnly;
     }
     AudioKind::None
@@ -328,7 +335,11 @@ pub fn scan_live(secs: u32, mut on_found: impl FnMut(Discovered)) {
             if let Some((mac, name)) = parse_scan_event(&line)
                 && discoverable(&paired, &mac, &name)
             {
-                on_found(Discovered { mac, name });
+                on_found(Discovered {
+                    mac,
+                    name,
+                    addr: AddrKind::Unknown,
+                });
             }
         }
     }
@@ -542,34 +553,68 @@ pub fn discovered_unpaired() -> Result<Vec<Discovered>, String> {
         .lines()
         .filter_map(parse_device_line)
         .filter(|(mac, name)| discoverable(&paired, mac, name))
-        .map(|(mac, name)| Discovered { mac, name })
+        .map(|(mac, name)| Discovered {
+            mac,
+            name,
+            addr: AddrKind::Unknown,
+        })
         .collect())
 }
 
-/// Collapse discovered devices that share a name into one pickable row,
-/// keeping first-seen order. One pair of earbuds routinely advertises three
-/// or four addresses at once; showing them all invites pairing the one that
+/// Collapse the addresses of one physical device into a single pickable row,
+/// keeping first-seen order. One pair of earbuds routinely advertises three or
+/// four addresses at once; showing them all invites pairing the one that
 /// carries no audio.
+///
+/// Sharing a name is not enough to be the same device — two identical headsets
+/// in one room announce the same name — so only rotating LE (random) addresses
+/// fold in. A group holds at most one stable address; a second one starts its
+/// own row, and stays pairable in its own right.
 pub fn group_discovered(items: &[Discovered]) -> Vec<DiscoveredGroup> {
     let mut groups: Vec<DiscoveredGroup> = Vec::new();
+    // Parallel to `groups`: does this row already own a stable address?
+    let mut has_stable: Vec<bool> = Vec::new();
     for d in items {
+        // An address already listed is the same address, whatever else it
+        // would qualify for — check that before anything can split it off.
+        if groups.iter().any(|g| g.macs.contains(&d.mac)) {
+            continue;
+        }
+        let stable = d.addr != AddrKind::Random;
         let key = d.name.trim();
-        match groups
-            .iter_mut()
-            .find(|g| g.name.trim().eq_ignore_ascii_case(key))
-        {
-            Some(g) => {
-                if !g.macs.contains(&d.mac) {
-                    g.macs.push(d.mac.clone());
-                }
+        let slot = groups
+            .iter()
+            .enumerate()
+            .find(|(i, g)| g.name.trim().eq_ignore_ascii_case(key) && !(stable && has_stable[*i]))
+            .map(|(i, _)| i);
+        match slot {
+            Some(i) => {
+                groups[i].macs.push(d.mac.clone());
+                has_stable[i] |= stable;
             }
-            None => groups.push(DiscoveredGroup {
-                name: d.name.clone(),
-                macs: vec![d.mac.clone()],
-            }),
+            None => {
+                groups.push(DiscoveredGroup {
+                    name: d.name.clone(),
+                    macs: vec![d.mac.clone()],
+                });
+                has_stable.push(stable);
+            }
         }
     }
     groups
+}
+
+/// Look up each entry's address kind — one `bluetoothctl info` per address,
+/// so it runs on the worker when a discovered list is assembled, never on the
+/// UI thread. Without it every address looks stable and nothing groups.
+pub fn fill_addr_kinds(items: &mut [Discovered]) {
+    for d in items.iter_mut() {
+        if d.addr == AddrKind::Unknown
+            && let Ok(i) = info(&d.mac)
+        {
+            d.addr = i.addr;
+        }
+    }
 }
 
 /// Order one group's addresses best-first for pairing. Costs one `info` call
@@ -743,6 +788,22 @@ mod tests {
     }
 
     #[test]
+    fn le_audio_client_is_not_a_sink() {
+        // A phone advertises LE Audio control services without being able to
+        // play anything; treating it as a sink costs an 8s poll per connect
+        // and produces a misleading warning.
+        let phone = "Device AA:BB:CC:DD:EE:FF (public)\n\
+                     \tUUID: Common Audio            (00001853-0000-1000-8000-00805f9b34fb)\n\
+                     \tUUID: Call Control            (00001852-0000-1000-8000-00805f9b34fb)\n";
+        assert_eq!(parse_audio_kind(phone), AudioKind::None);
+
+        let earbuds = "Device AA:BB:CC:DD:EE:FF (random)\n\
+                       \tUUID: Audio Stream Control    (0000184e-0000-1000-8000-00805f9b34fb)\n\
+                       \tUUID: Published Audio Capabil (00001850-0000-1000-8000-00805f9b34fb)\n";
+        assert_eq!(parse_audio_kind(earbuds), AudioKind::LeAudioOnly);
+    }
+
+    #[test]
     fn non_audio_device_is_not_routable() {
         let out = "Device AA:BB:CC:DD:EE:FF (random)\n\
                    \tUUID: Human Interface Device   (00001812-0000-1000-8000-00805f9b34fb)\n";
@@ -752,32 +813,56 @@ mod tests {
         assert!(!info.audio.routable());
     }
 
+    fn disc(mac: &str, name: &str, addr: AddrKind) -> Discovered {
+        Discovered {
+            mac: mac.into(),
+            name: name.into(),
+            addr,
+        }
+    }
+
     #[test]
     fn groups_discovered_by_name() {
         let items = vec![
-            Discovered {
-                mac: "40:7E:72:67:25:64".into(),
-                name: "Pavel's Buds3 Pro".into(),
-            },
-            Discovered {
-                mac: "7C:AF:C1:52:DC:A8".into(),
-                name: "Pavel's Buds3 Pro".into(),
-            },
-            Discovered {
-                mac: "78:C1:1D:12:D4:96".into(),
-                name: "S26 Ultra".into(),
-            },
+            disc("40:7E:72:67:25:64", "Pavel's Buds3 Pro", AddrKind::Public),
+            disc("7C:AF:C1:52:DC:A8", "Pavel's Buds3 Pro", AddrKind::Random),
+            disc("78:C1:1D:12:D4:96", "S26 Ultra", AddrKind::Public),
             // A duplicate address must not be listed twice.
-            Discovered {
-                mac: "40:7E:72:67:25:64".into(),
-                name: "Pavel's Buds3 Pro".into(),
-            },
+            disc("40:7E:72:67:25:64", "Pavel's Buds3 Pro", AddrKind::Public),
         ];
         let groups = group_discovered(&items);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].name, "Pavel's Buds3 Pro");
         assert_eq!(groups[0].macs.len(), 2);
         assert_eq!(groups[1].macs, vec!["78:C1:1D:12:D4:96"]);
+    }
+
+    #[test]
+    fn two_identical_devices_stay_separately_pairable() {
+        // Two people with the same earbuds in one room: both announce the same
+        // name on their own stable address. Merging them would hide one device
+        // and aim a pairing attempt at a stranger's.
+        let items = vec![
+            disc("40:7E:72:67:25:64", "Galaxy Buds3 Pro", AddrKind::Public),
+            disc("52:11:22:33:44:55", "Galaxy Buds3 Pro", AddrKind::Random),
+            disc("AA:BB:CC:DD:EE:FF", "Galaxy Buds3 Pro", AddrKind::Public),
+        ];
+        let groups = group_discovered(&items);
+        assert_eq!(groups.len(), 2);
+        // The rotating LE address folds into the first unit, not the second.
+        assert_eq!(groups[0].macs.len(), 2);
+        assert_eq!(groups[1].macs, vec!["AA:BB:CC:DD:EE:FF"]);
+    }
+
+    #[test]
+    fn unknown_address_kinds_do_not_merge() {
+        // Before `fill_addr_kinds` runs, nothing is known to rotate — stay on
+        // the safe side and keep every address pickable.
+        let items = vec![
+            disc("40:7E:72:67:25:64", "Buds", AddrKind::Unknown),
+            disc("7C:AF:C1:52:DC:A8", "Buds", AddrKind::Unknown),
+        ];
+        assert_eq!(group_discovered(&items).len(), 2);
     }
 
     #[test]

@@ -72,9 +72,11 @@ same name, so pairing the one you happen to see first is a coin flip; the LE
 one connects happily and plays nothing.
 
 blueRat collapses these into a single picker row and prefers the classic
-address, so scanning and pairing from inside blueRat avoids the problem. If
-you already paired the wrong one, remove it with `x`, put the device back in
-pairing mode, and pair again from the scan picker.
+address, so scanning and pairing from inside blueRat avoids the problem. Only
+the rotating addresses fold in — two identical headsets in the same room keep
+a row each and stay separately pairable. If you already paired the wrong one,
+remove it with `x`, put the device back in pairing mode, and pair again from
+the scan picker.
 
 **The device is LE Audio only.** Some devices offer no classic A2DP at all.
 LE Audio needs `Experimental = true` and `KernelExperimental = true` under
