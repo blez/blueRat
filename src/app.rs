@@ -64,6 +64,13 @@ pub struct App {
     /// the picker (or queues a pair) mid-scan, so the scan's final list can't
     /// yank them back into a view they already left.
     pub ignore_scan_results: bool,
+    /// The key-binding popup, shown by `?`. It is an overlay rather than a
+    /// `View`: it can appear over any of them, and replacing the view would
+    /// throw away its state — a running scan's results, loaded device info,
+    /// a pending remove confirmation.
+    pub help: bool,
+    /// First row of the help list on screen; the renderer clamps it.
+    pub help_scroll: u16,
     pub tick: u64,
     pub quit: bool,
 }
@@ -82,6 +89,8 @@ impl App {
             pending: 0,
             last_done: Instant::now(),
             ignore_scan_results: false,
+            help: false,
+            help_scroll: 0,
             tick: 0,
             quit: false,
         }
@@ -223,6 +232,9 @@ impl App {
             Msg::Status(s, tone) => self.push_log(s, tone),
             Msg::Progress(s) => self.progress = Some(s),
             Msg::PairPrompt { pin, passkey } => {
+                // The prompt blocks the pairing until it is answered, so it
+                // takes the screen back from the help overlay.
+                self.help = false;
                 self.view = View::PairPrompt {
                     pin,
                     passkey,
@@ -294,6 +306,36 @@ impl App {
                 }
                 _ => {}
             }
+            return None;
+        }
+
+        // The help overlay swallows keys while it is up, ahead of the busy
+        // gate below — otherwise j/k would scroll nothing and quietly move the
+        // device cursor hidden behind the popup instead.
+        if self.help {
+            match key.code {
+                KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
+                    self.help = false;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.help_scroll = self.help_scroll.saturating_add(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                }
+                KeyCode::Char('g') => self.help_scroll = 0,
+                KeyCode::Char('G') => self.help_scroll = u16::MAX,
+                _ => {}
+            }
+            return None;
+        }
+
+        // It answers "what were the other keys?", so it opens from anywhere
+        // except text entry — including mid-operation, where the border row
+        // has the fewest chips left.
+        if !self.filtering && key.code == KeyCode::Char('?') {
+            self.help = true;
+            self.help_scroll = 0;
             return None;
         }
 
@@ -716,6 +758,130 @@ mod tests {
             Some(Cmd::Doctor { device }) => assert!(device.is_none()),
             _ => panic!("d should run host-only diagnostics"),
         }
+    }
+
+    #[test]
+    fn question_mark_toggles_the_help_popup() {
+        let mut app = app_with_devices();
+        assert!(app.handle_key(key(KeyCode::Char('?'))).is_none());
+        assert!(app.help);
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(!app.help);
+    }
+
+    #[test]
+    fn help_opens_while_busy() {
+        // Exactly when it is needed most: mid-operation the border row is at
+        // its shortest, so the dropped keys have to be reachable some way.
+        let mut app = app_with_devices();
+        app.begin("Scanning ~10s…");
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(app.help);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.help);
+        assert!(!app.quit, "Esc should close the popup, not quit");
+    }
+
+    #[test]
+    fn help_scrolls_while_busy_without_moving_the_hidden_cursor() {
+        // j/k must reach the overlay, not the device list underneath it.
+        let mut app = app_with_devices();
+        app.handle_msg(Msg::Devices(vec![
+            Device {
+                mac: "AA:BB:CC:DD:EE:FF".into(),
+                name: "A".into(),
+                connected: false,
+                trusted: false,
+                battery: None,
+            },
+            Device {
+                mac: "11:22:33:44:55:66".into(),
+                name: "B".into(),
+                connected: false,
+                trusted: false,
+                battery: None,
+            },
+        ]));
+        app.begin("Scanning ~10s…");
+        app.handle_key(key(KeyCode::Char('?')));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.help_scroll, 1);
+        assert_eq!(app.selected, 0, "the list behind the popup must not move");
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.help_scroll, 0);
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.help_scroll, u16::MAX, "renderer clamps this");
+    }
+
+    #[test]
+    fn help_preserves_the_view_underneath() {
+        // Opening help over a running scan must not drop the picker: its
+        // items would stop accumulating and closing help would strand the
+        // user on the device list.
+        let mut app = scanning_app();
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(app.help);
+        assert!(matches!(app.view, View::ScanResults { .. }));
+        // Devices found while help is up still land in the picker.
+        app.handle_msg(Msg::Found(disc("33:33:33:33:33:33", "Buds C")));
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(!app.help);
+        match &app.view {
+            View::ScanResults { items, .. } => assert_eq!(items.len(), 3),
+            _ => panic!("should return to the picker it was opened over"),
+        }
+    }
+
+    #[test]
+    fn help_over_a_confirmation_does_not_answer_it() {
+        // y/n belong to the overlay while it is up; the pending remove must
+        // survive untouched.
+        let mut app = app_with_devices();
+        app.handle_key(key(KeyCode::Char('x')));
+        assert!(matches!(app.view, View::ConfirmRemove { .. }));
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(app.handle_key(key(KeyCode::Char('y'))).is_none());
+        assert!(matches!(app.view, View::ConfirmRemove { .. }));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.help);
+        assert!(matches!(app.view, View::ConfirmRemove { .. }));
+    }
+
+    #[test]
+    fn a_pairing_prompt_takes_the_screen_back_from_help() {
+        let mut app = app_with_devices();
+        app.begin("Pairing…");
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(app.help);
+        app.handle_msg(Msg::PairPrompt {
+            pin: false,
+            passkey: "461829".into(),
+        });
+        assert!(!app.help, "the prompt blocks pairing until answered");
+        assert!(matches!(app.view, View::PairPrompt { .. }));
+    }
+
+    #[test]
+    fn question_mark_is_filter_text_not_a_shortcut() {
+        let mut app = app_with_devices();
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Char('?')));
+        assert_eq!(app.filter, "?");
+        assert!(matches!(app.view, View::DeviceList));
+    }
+
+    #[test]
+    fn help_does_not_hijack_a_pairing_prompt() {
+        // A PIN can legitimately contain '?'; answering the prompt wins.
+        let mut app = app_with_devices();
+        app.begin("Pairing…");
+        app.handle_msg(Msg::PairPrompt {
+            pin: true,
+            passkey: String::new(),
+        });
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(matches!(app.view, View::PairPrompt { .. }));
+        assert!(!app.help);
     }
 
     #[test]

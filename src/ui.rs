@@ -46,12 +46,98 @@ const CONTENT_MIN: u16 = 40;
 const DETAILS_MAX_RATIO: u32 = 90;
 /// Columns of breathing room between the details text and its border.
 const DETAILS_PAD: u16 = 1;
+/// Narrowest a popup may be before it just takes whatever the screen has.
+const POPUP_MIN_W: u16 = 20;
+
+/// Width for a popup that would like `want` columns: at least readable, never
+/// more than `DETAILS_MAX_RATIO` of the screen, never wider than the screen.
+///
+/// The order matters. `clamp` panics when min > max, so a terminal narrower
+/// than `POPUP_MIN_W` must not be allowed to produce `clamp(20, 19)`.
+fn popup_width(want: u16, screen_w: u16) -> u16 {
+    let cap = ((screen_w as u32 * DETAILS_MAX_RATIO / 100) as u16)
+        .max(POPUP_MIN_W)
+        .min(screen_w.max(1));
+    want.max(POPUP_MIN_W.min(cap)).min(cap)
+}
 
 /// Where the event log renders this frame.
 enum LogSlot {
     Bottom(Rect),
     Side(Rect),
 }
+
+/// One `[key→action]` chip in the bottom border.
+struct Hint {
+    key: &'static str,
+    action: &'static str,
+    /// Drop order when the row is wider than the terminal: highest goes
+    /// first. Values are distinct within a row so the order is explicit
+    /// rather than an accident of how ties are broken.
+    prio: u8,
+}
+
+const fn h(key: &'static str, action: &'static str, prio: u8) -> Hint {
+    Hint { key, action, prio }
+}
+
+// The last two standing are `q` and `?`: how to leave, and how to find
+// everything this row had to drop.
+const HINTS_DEVICE_LIST: [Hint; 11] = [
+    h("Enter", "Toggle", 2),
+    h("s", "Scan", 3),
+    h("a", "Audio", 6),
+    h("i", "Info", 5),
+    h("/", "Filter", 7),
+    h("t", "Trust", 8),
+    h("x", "Remove", 9),
+    h("d", "Doctor", 4),
+    h("r", "Refresh", 10),
+    h("?", "Keys", 1),
+    h("q", "Quit", 0),
+];
+
+enum HelpRow {
+    Section(&'static str),
+    Key(&'static str, &'static str),
+}
+
+use HelpRow::{Key, Section};
+
+/// The full binding list behind `?`. The border row above is a deliberately
+/// shortened subset, so this is the authoritative one and the place to add a
+/// new key.
+const HELP: [HelpRow; 21] = [
+    Section("Navigation"),
+    Key("j / ↓", "move down"),
+    Key("k / ↑", "move up"),
+    Key("g / G", "jump to first / last"),
+    Section("Devices"),
+    Key("Enter", "connect / disconnect"),
+    Key("s", "scan & pair a new device"),
+    Key("t", "trust / untrust"),
+    Key("x / Del", "remove (asks first)"),
+    Key("r", "refresh now"),
+    Section("Audio"),
+    Key("a", "switch profile (A2DP ↔ mic)"),
+    Key("d", "audio diagnostics"),
+    Section("Finding things"),
+    Key("/", "filter by name"),
+    Key("i", "device details"),
+    Key("?", "this list"),
+    Section("Leaving"),
+    Key("Esc", "back — clears the filter first"),
+    Key("q", "quit (back, in a popup)"),
+    Key("Ctrl-C", "quit from anywhere"),
+];
+const HINTS_SCAN: [Hint; 3] = [
+    h("Enter", "Pair", 1),
+    h("j/k", "Move", 2),
+    h("Esc", "Back", 0),
+];
+const HINTS_DETAILS: [Hint; 2] = [h("j/k", "Scroll", 1), h("Esc", "Close", 0)];
+const HINTS_PIN: [Hint; 2] = [h("Enter", "Submit", 1), h("Esc", "Cancel", 0)];
+const HINTS_YES_NO: [Hint; 2] = [h("y", "Yes", 1), h("n", "No", 0)];
 
 fn fg(c: Color) -> Style {
     Style::new().fg(c)
@@ -62,25 +148,22 @@ fn bold(c: Color) -> Style {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let hints: &[(&str, &str)] = match &app.view {
-        View::ScanResults { .. } => &[("Enter", "Pair"), ("j/k", "Move"), ("Esc", "Back")],
-        View::ConfirmRemove { .. } => &[("y", "Yes"), ("n", "No")],
-        View::Details { .. } => &[("j/k", "Scroll"), ("Esc", "Close")],
-        View::PairPrompt { pin: true, .. } => &[("Enter", "Submit"), ("Esc", "Cancel")],
-        View::PairPrompt { .. } => &[("y", "Yes"), ("n", "No")],
-        View::DeviceList => &[
-            ("Enter", "Toggle"),
-            ("s", "Scan"),
-            ("a", "Audio"),
-            ("i", "Info"),
-            ("/", "Filter"),
-            ("t", "Trust"),
-            ("x", "Remove"),
-            ("d", "Doctor"),
-            ("r", "Refresh"),
-            ("q", "Quit"),
-        ],
+    // The overlay owns the keyboard while it is up, so it owns the hint row.
+    let hints: &[Hint] = if app.help {
+        &HINTS_DETAILS
+    } else {
+        match &app.view {
+            View::ScanResults { .. } => &HINTS_SCAN,
+            View::ConfirmRemove { .. } => &HINTS_YES_NO,
+            View::Details { .. } => &HINTS_DETAILS,
+            View::PairPrompt { pin: true, .. } => &HINTS_PIN,
+            View::PairPrompt { .. } => &HINTS_YES_NO,
+            View::DeviceList => &HINTS_DEVICE_LIST,
+        }
     };
+    // The bottom border is the only room the hints get: the two corner glyphs
+    // are not ours to write over.
+    let hint_budget = frame.area().width.saturating_sub(2);
 
     let outer = Block::bordered()
         .border_style(fg(STEEL))
@@ -95,7 +178,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ])
             .centered(),
         )
-        .title_bottom(hint_line(hints).centered());
+        .title_bottom(hint_line(&fit_hints(hints, hint_budget)).centered());
     let inner = outer.inner(frame.area());
     frame.render_widget(outer, frame.area());
 
@@ -287,11 +370,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .min(u16::MAX as usize - 4) as u16;
         // "┤ 󰋽 " + name + " ├"
         let title_w = name.chars().count().min(u16::MAX as usize - 8) as u16 + 6;
-        let screen_w = frame.area().width;
-        let cap = ((screen_w as u32 * DETAILS_MAX_RATIO / 100) as u16).clamp(20, screen_w.max(1));
         // Borders plus the padding the block will eat on both sides.
         let chrome = 2 + 2 * DETAILS_PAD;
-        let width = (longest.max(title_w) + chrome).clamp(20.min(cap), cap);
+        let width = popup_width(longest.max(title_w) + chrome, frame.area().width);
         let inner_w = width.saturating_sub(chrome).max(1) as usize;
         // Wrap by hand so the row count is exact — Paragraph's Wrap would
         // silently clip whatever the (line-count-based) height missed.
@@ -418,6 +499,66 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             area,
         );
     }
+
+    // Last, so the overlay sits above every popup it can be opened over.
+    if app.help {
+        // Key column wide enough for the longest binding, so the descriptions
+        // line up into a readable second column.
+        let key_w = HELP
+            .iter()
+            .filter_map(|r| match r {
+                Key(k, _) => Some(k.chars().count()),
+                Section(_) => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let rows: Vec<Line> = HELP
+            .iter()
+            .map(|row| match row {
+                Section(title) => Line::from(vec![
+                    Span::styled("─ ", fg(STEEL_DIM)),
+                    Span::styled(*title, bold(BLUE)),
+                ]),
+                Key(k, what) => Line::from(vec![
+                    Span::styled(format!("  {k:>key_w$}"), bold(ORANGE)),
+                    Span::styled("  ", fg(TEXT)),
+                    Span::styled(*what, fg(TEXT)),
+                ]),
+            })
+            .collect();
+        let longest = rows.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
+        let chrome = 2 + 2 * DETAILS_PAD;
+        let width = popup_width(longest + chrome, frame.area().width);
+
+        let height = (rows.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
+        let visible = height.saturating_sub(2) as usize;
+        let max_scroll = rows.len().saturating_sub(visible) as u16;
+        app.help_scroll = app.help_scroll.min(max_scroll);
+        let start = app.help_scroll as usize;
+        let end = (start + visible).min(rows.len());
+
+        let mut block = Block::bordered()
+            .border_style(fg(STEEL))
+            .padding(Padding::horizontal(DETAILS_PAD))
+            .title(Line::from(vec![
+                Span::styled("┤ 󰌌 ", fg(STEEL)),
+                Span::styled("Keys", bold(BLUE)),
+                Span::styled(" ├", fg(STEEL)),
+            ]));
+        if max_scroll > 0 {
+            block = block.title_bottom(
+                Line::from(vec![
+                    Span::styled("┤", fg(STEEL)),
+                    Span::styled(format!("{}–{}/{}", start + 1, end, rows.len()), bold(ICE)),
+                    Span::styled("├", fg(STEEL)),
+                ])
+                .right_aligned(),
+            );
+        }
+        let area = center(frame.area(), width, height);
+        frame.render_widget(Clear, area);
+        frame.render_widget(Paragraph::new(rows[start..end].to_vec()).block(block), area);
+    }
 }
 
 fn tone_style(tone: Tone) -> Style {
@@ -482,17 +623,47 @@ fn fit_tail(lines: Vec<Line<'static>>, width: u16, height: u16) -> Vec<Line<'sta
     kept
 }
 
+/// Rendered width of a chip row: `[key→action]` per hint, `─` between.
+fn hints_width(hints: &[&Hint]) -> usize {
+    hints
+        .iter()
+        .map(|h| h.key.chars().count() + h.action.chars().count() + 3)
+        .sum::<usize>()
+        + hints.len().saturating_sub(1)
+}
+
+/// Drop the least important chips until the row fits the border it lives in.
+/// Overflowing instead would clip the row mid-chip and, because the title is
+/// centered, eat the keys at *both* ends — including how to quit.
+fn fit_hints(hints: &[Hint], budget: u16) -> Vec<&Hint> {
+    let mut sel: Vec<&Hint> = hints.iter().collect();
+    while hints_width(&sel) > budget as usize && sel.len() > 1 {
+        // max_by_key returns the last maximum, so ties drop right-to-left.
+        let idx = sel
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, h)| h.prio)
+            .map(|(i, _)| i)
+            .unwrap();
+        sel.remove(idx);
+    }
+    if hints_width(&sel) > budget as usize {
+        sel.clear();
+    }
+    sel
+}
+
 /// `─[Enter→Toggle]─[s→Pair new]─…` chips for the bottom border.
-fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
+fn hint_line(hints: &[&Hint]) -> Line<'static> {
     let mut spans = Vec::new();
-    for (i, (key, action)) in hints.iter().enumerate() {
+    for (i, hint) in hints.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("─", fg(STEEL)));
         }
         spans.push(Span::styled("[", fg(SLATE)));
-        spans.push(Span::styled((*key).to_string(), bold(ORANGE)));
+        spans.push(Span::styled(hint.key, bold(ORANGE)));
         spans.push(Span::styled("→", fg(SLATE)));
-        spans.push(Span::styled((*action).to_string(), fg(TEXT)));
+        spans.push(Span::styled(hint.action, fg(TEXT)));
         spans.push(Span::styled("]", fg(SLATE)));
     }
     Line::from(spans)
@@ -555,4 +726,109 @@ fn center(area: Rect, width: u16, height: u16) -> Rect {
         .flex(Flex::Center)
         .areas(area);
     area
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(sel: &[&Hint]) -> Vec<&'static str> {
+        sel.iter().map(|h| h.key).collect()
+    }
+
+    #[test]
+    fn wide_terminal_keeps_every_hint() {
+        let sel = fit_hints(&HINTS_DEVICE_LIST, 200);
+        assert_eq!(sel.len(), HINTS_DEVICE_LIST.len());
+    }
+
+    #[test]
+    fn narrow_terminal_drops_hints_instead_of_clipping() {
+        // The laptop case: a ~75-column window cannot hold the full 106-column
+        // row, and a clipped row loses the keys at both ends.
+        let budget = 73;
+        let sel = fit_hints(&HINTS_DEVICE_LIST, budget);
+        assert!(hints_width(&sel) <= budget as usize);
+        assert!(sel.len() < HINTS_DEVICE_LIST.len());
+        // Whatever survives, these do.
+        let k = keys(&sel);
+        assert!(k.contains(&"Enter"), "got {k:?}");
+        assert!(k.contains(&"?"), "got {k:?}");
+        assert!(k.contains(&"q"), "got {k:?}");
+        // Display order is preserved, not shuffled by priority.
+        let order: Vec<usize> = k
+            .iter()
+            .map(|key| {
+                HINTS_DEVICE_LIST
+                    .iter()
+                    .position(|h| h.key == *key)
+                    .unwrap()
+            })
+            .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "got {order:?}");
+    }
+
+    #[test]
+    fn very_narrow_terminal_keeps_the_way_out_and_the_way_in() {
+        // Too narrow even for Enter: what has to survive is how to leave and
+        // how to look up everything that was dropped.
+        let sel = fit_hints(&HINTS_DEVICE_LIST, 30);
+        assert!(hints_width(&sel) <= 30);
+        assert_eq!(keys(&sel), vec!["?", "q"]);
+    }
+
+    #[test]
+    fn popup_width_survives_a_terminal_narrower_than_the_minimum() {
+        // `clamp(20, 19)` panics, and it panicked inside draw() — every frame,
+        // unrecoverably — the moment `?` was pressed on a 19-column terminal.
+        for screen in 0..=25u16 {
+            let w = popup_width(80, screen);
+            assert!(
+                w <= screen.max(1),
+                "popup wider than the screen at {screen}"
+            );
+            assert!(w >= 1, "zero-width popup at {screen}");
+        }
+    }
+
+    #[test]
+    fn popup_width_fits_content_up_to_the_cap() {
+        // Short content gets a short popup; long content stops at 90%.
+        assert_eq!(popup_width(40, 200), 40);
+        assert_eq!(popup_width(400, 200), 180);
+        // Never below the readable minimum while the screen allows it.
+        assert_eq!(popup_width(5, 200), POPUP_MIN_W);
+    }
+
+    #[test]
+    fn every_hint_row_has_distinct_priorities() {
+        // Ties would make the drop order depend on max_by_key's tie-break
+        // rather than on intent — that is how `q` once got dropped first.
+        for set in [
+            &HINTS_DEVICE_LIST[..],
+            &HINTS_SCAN[..],
+            &HINTS_DETAILS[..],
+            &HINTS_PIN[..],
+            &HINTS_YES_NO[..],
+        ] {
+            let mut prios: Vec<u8> = set.iter().map(|h| h.prio).collect();
+            prios.sort_unstable();
+            let before = prios.len();
+            prios.dedup();
+            assert_eq!(prios.len(), before, "duplicate priority in a hint row");
+        }
+    }
+
+    #[test]
+    fn hopeless_width_yields_no_chips_rather_than_a_broken_one() {
+        assert!(fit_hints(&HINTS_DEVICE_LIST, 3).is_empty());
+        assert!(fit_hints(&HINTS_DEVICE_LIST, 0).is_empty());
+    }
+
+    #[test]
+    fn short_hint_rows_are_untouched() {
+        for set in [&HINTS_SCAN[..], &HINTS_DETAILS[..], &HINTS_YES_NO[..]] {
+            assert_eq!(fit_hints(set, 80).len(), set.len());
+        }
+    }
 }

@@ -41,7 +41,11 @@ just the tools you already have, with a fast keyboard-driven interface on top.
 | `x` / `Del`            | remove device (confirmation)                                  |
 | `d`                    | audio diagnostics for the host + selected device               |
 | `r`                    | refresh                                                       |
+| `?`                    | all key bindings                                              |
 | `q` / `Esc` / `Ctrl-C` | quit / back (Esc clears the filter first)                     |
+
+The bottom border shows as many of these as fit; on a narrow window the least
+important chips drop out, and `?` opens the full list.
 
 ## Requirements
 
