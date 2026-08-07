@@ -5,8 +5,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
-use crate::audio;
-use crate::bt::{self, Device, Discovered, PairEvent};
+use crate::bt::{self, AudioKind, Device, Discovered, PairEvent};
+use crate::{audio, diag};
 
 pub enum Cmd {
     Refresh,
@@ -20,7 +20,11 @@ pub enum Cmd {
     },
     Scan,
     PairConnect {
-        mac: String,
+        /// Every address discovered under this name. Earbuds advertise
+        /// several at once and only some carry audio, so the worker ranks
+        /// them and works down the list instead of trusting the user to
+        /// have picked the right row.
+        candidates: Vec<String>,
         name: String,
         /// The full scan-result list, so a pair failure can reopen the picker
         /// instead of forcing another 10s scan.
@@ -39,6 +43,10 @@ pub enum Cmd {
     Details {
         mac: String,
         name: String,
+    },
+    /// Host-wide (and optionally per-device) audio-routing diagnostics.
+    Doctor {
+        device: Option<(String, String)>,
     },
     /// The user's answer to a pairing agent prompt ("yes"/"no"/PIN). Consumed
     /// inside a running PairConnect; meaningless on its own.
@@ -125,13 +133,26 @@ fn run(cmd: Cmd, rx: &Receiver<Cmd>, tx: &Sender<Msg>, audio_available: bool) ->
     let progress = |s: String| {
         let _ = tx.send(Msg::Progress(s));
     };
-    let route = |mac: &str| {
-        if audio_available
-            && audio::route_audio(mac, |s| {
-                let _ = tx.send(Msg::Progress(s));
-            })
-        {
+    // Routing failure used to be silent, which is exactly the confusing case:
+    // the device connects, nothing is said, and sound keeps coming out of the
+    // speakers. Always report the outcome, and explain a failure.
+    let route = |mac: &str, kind: AudioKind| {
+        if !audio_available {
+            let _ = tx.send(Msg::Status(
+                "Connected, but audio cannot be routed ('pactl' not found)".into(),
+                Tone::Warn,
+            ));
+            return;
+        }
+        if audio::route_audio(mac, |s| {
+            let _ = tx.send(Msg::Progress(s));
+        }) {
             let _ = tx.send(Msg::Status("Audio routed".into(), Tone::Ok));
+        } else {
+            let _ = tx.send(Msg::Status(
+                diag::routing_failure_hint(mac, kind),
+                Tone::Warn,
+            ));
         }
     };
 
@@ -168,10 +189,10 @@ fn run(cmd: Cmd, rx: &Receiver<Cmd>, tx: &Sender<Msg>, audio_available: bool) ->
             } else {
                 progress(format!("Connecting {name}…"));
                 if bt::connect(&mac) {
-                    // Only audio-sink devices grow a sink — don't make mice
+                    // Only audio devices grow a sink — don't make mice
                     // and keyboards wait through the 8s sink poll.
-                    if info.audio {
-                        route(&mac);
+                    if info.audio.routable() {
+                        route(&mac, info.audio);
                     }
                     status(format!("Connected {name}"), Tone::Ok);
                 } else {
@@ -219,40 +240,74 @@ fn run(cmd: Cmd, rx: &Receiver<Cmd>, tx: &Sender<Msg>, audio_available: bool) ->
                 }
             }
         }
-        Cmd::PairConnect { mac, name, others } => {
+        Cmd::PairConnect {
+            candidates,
+            name,
+            others,
+        } => {
             if let Err(e) = bt::adapter_up() {
                 status(e, Tone::Err);
                 return true;
             }
             progress(format!("Pairing {name}…"));
-            // Interactive session so agent prompts (passkey/PIN) reach the
-            // user; fall back to the one-shot pair if it can't start.
-            let paired = match bt::pair_interactive(&mac, |ev| {
-                let msg = match ev {
-                    PairEvent::ConfirmPasskey(passkey) => Msg::PairPrompt {
-                        pin: false,
-                        passkey,
-                    },
-                    PairEvent::RequestPin => Msg::PairPrompt {
-                        pin: true,
-                        passkey: String::new(),
-                    },
-                };
-                if tx.send(msg).is_err() {
-                    return None;
+            // Best address first: a classic A2DP one before an LE-only one.
+            // Ranking costs an `info` call each, so it happens here and not
+            // during the scan.
+            let ranked = bt::rank_candidates(&candidates);
+            let multi = ranked.len() > 1;
+
+            let mut paired_mac = None;
+            for (i, mac) in ranked.iter().enumerate() {
+                if multi {
+                    progress(format!(
+                        "Pairing {name} — address {}/{}…",
+                        i + 1,
+                        ranked.len()
+                    ));
                 }
-                loop {
-                    match rx.recv() {
-                        Ok(Cmd::PairReply(ans)) => return Some(ans),
-                        Ok(_) => continue, // gated by busy; nothing else expected
-                        Err(_) => return None,
+                // Interactive session so agent prompts (passkey/PIN) reach the
+                // user; fall back to the one-shot pair if it can't start.
+                let ok = match bt::pair_interactive(mac, |ev| {
+                    let msg = match ev {
+                        PairEvent::ConfirmPasskey(passkey) => Msg::PairPrompt {
+                            pin: false,
+                            passkey,
+                        },
+                        PairEvent::RequestPin => Msg::PairPrompt {
+                            pin: true,
+                            passkey: String::new(),
+                        },
+                    };
+                    if tx.send(msg).is_err() {
+                        return None;
                     }
+                    loop {
+                        match rx.recv() {
+                            Ok(Cmd::PairReply(ans)) => return Some(ans),
+                            Ok(_) => continue, // gated by busy; nothing else expected
+                            Err(_) => return None,
+                        }
+                    }
+                }) {
+                    Ok(ok) => ok,
+                    Err(_) => bt::pair(mac),
+                };
+                if ok {
+                    paired_mac = Some(mac.clone());
+                    break;
                 }
-            }) {
-                Ok(ok) => ok,
-                Err(_) => bt::pair(&mac),
-            };
-            if !paired {
+                // A device that advertises several addresses usually only
+                // accepts pairing on one of them; a rejection is expected, so
+                // keep going instead of reporting failure.
+                if multi && i + 1 < ranked.len() {
+                    let _ = tx.send(Msg::Progress(format!(
+                        "{name}: address {} refused, trying the next…",
+                        i + 1
+                    )));
+                }
+            }
+
+            let Some(mac) = paired_mac else {
                 status(
                     format!("Pairing failed: {name} — pick a device to retry, Esc to leave"),
                     Tone::Err,
@@ -260,12 +315,13 @@ fn run(cmd: Cmd, rx: &Receiver<Cmd>, tx: &Sender<Msg>, audio_available: bool) ->
                 // Reopen the picker with the same scan results so the user
                 // doesn't have to sit through another 10s scan.
                 return tx.send(Msg::ScanResults(others)).is_ok();
-            }
+            };
             bt::trust(&mac);
             progress(format!("Connecting {name}…"));
             if bt::connect(&mac) {
-                if bt::info(&mac).map(|i| i.audio).unwrap_or(false) {
-                    route(&mac);
+                let kind = bt::info(&mac).map(|i| i.audio).unwrap_or_default();
+                if kind.routable() {
+                    route(&mac, kind);
                 }
                 status(format!("Paired & connected {name}"), Tone::Ok);
             } else {
@@ -334,6 +390,18 @@ fn run(cmd: Cmd, rx: &Receiver<Cmd>, tx: &Sender<Msg>, audio_available: bool) ->
                 status(format!("Cannot read info of {name}: {e}"), Tone::Err);
             }
         },
+        Cmd::Doctor { device } => {
+            progress("Running diagnostics…".into());
+            let text = diag::report(
+                device
+                    .as_ref()
+                    .map(|(mac, name)| (mac.as_str(), name.as_str())),
+            );
+            let _ = tx.send(Msg::Details {
+                name: "Audio diagnostics".into(),
+                text,
+            });
+        }
     }
     true
 }

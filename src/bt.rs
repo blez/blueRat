@@ -21,14 +21,57 @@ pub struct Discovered {
     pub name: String,
 }
 
+/// One physical device as offered in the scan picker. Modern earbuds announce
+/// themselves on several addresses at once (a classic BR/EDR one plus rotating
+/// LE private ones), all under the same name; pairing the wrong one yields a
+/// connection with no audio sink. The picker shows one row per name and the
+/// worker picks the address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredGroup {
+    pub name: String,
+    pub macs: Vec<String>,
+}
+
+/// How a device's address was assigned. Random addresses are LE-only; a
+/// classic (audio-capable) radio always uses a public one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum AddrKind {
+    Public,
+    Random,
+    #[default]
+    Unknown,
+}
+
+/// Which audio transport a device offers, as advertised in its UUID list.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum AudioKind {
+    /// No audio profile at all (mouse, keyboard, phone).
+    #[default]
+    None,
+    /// A2DP Audio Sink (0000110b) — classic audio. Works with any
+    /// PipeWire/PulseAudio bluez backend.
+    Classic,
+    /// Only LE Audio (BAP) services, no A2DP. Routing these needs a kernel
+    /// ISO socket *and* a BAP-capable session manager; without both, the
+    /// device connects happily and no sink ever appears.
+    LeAudioOnly,
+}
+
+impl AudioKind {
+    /// Worth waiting on a sink for after connecting.
+    pub fn routable(self) -> bool {
+        !matches!(self, AudioKind::None)
+    }
+}
+
 /// Live state of one device, from `bluetoothctl info`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Info {
     pub connected: bool,
     pub trusted: bool,
-    /// Offers an A2DP Audio Sink profile (headphones/speakers) — the only
-    /// devices worth waiting on for audio routing.
-    pub audio: bool,
+    /// Which audio transport the device offers, if any.
+    pub audio: AudioKind,
+    pub addr: AddrKind,
     pub battery: Option<u8>,
 }
 
@@ -157,8 +200,43 @@ fn parse_info(out: &str) -> Info {
     Info {
         connected: out.contains("Connected: yes"),
         trusted: out.contains("Trusted: yes"),
-        audio: out.contains("Audio Sink"),
+        audio: parse_audio_kind(out),
+        addr: parse_addr_kind(out),
         battery: parse_battery(out),
+    }
+}
+
+/// LE Audio service UUIDs. bluetoothctl truncates long names to a fixed
+/// column ("Published Audio Capabil.."), so these are matched as prefixes.
+const LE_AUDIO_UUIDS: [&str; 3] = [
+    "Audio Stream Control",
+    "Published Audio Capabil",
+    "Common Audio",
+];
+
+/// A2DP beats LE Audio when a device offers both: classic audio needs no
+/// experimental kernel support, so it is the transport that actually works.
+fn parse_audio_kind(out: &str) -> AudioKind {
+    if out.contains("Audio Sink") {
+        return AudioKind::Classic;
+    }
+    if LE_AUDIO_UUIDS.iter().any(|u| out.contains(u)) {
+        return AudioKind::LeAudioOnly;
+    }
+    AudioKind::None
+}
+
+/// "Device AA:BB:CC:DD:EE:FF (public)" → Public.
+fn parse_addr_kind(out: &str) -> AddrKind {
+    let Some(line) = out.lines().find(|l| l.starts_with("Device ")) else {
+        return AddrKind::Unknown;
+    };
+    if line.contains("(public)") {
+        AddrKind::Public
+    } else if line.contains("(random)") {
+        AddrKind::Random
+    } else {
+        AddrKind::Unknown
     }
 }
 
@@ -468,6 +546,63 @@ pub fn discovered_unpaired() -> Result<Vec<Discovered>, String> {
         .collect())
 }
 
+/// Collapse discovered devices that share a name into one pickable row,
+/// keeping first-seen order. One pair of earbuds routinely advertises three
+/// or four addresses at once; showing them all invites pairing the one that
+/// carries no audio.
+pub fn group_discovered(items: &[Discovered]) -> Vec<DiscoveredGroup> {
+    let mut groups: Vec<DiscoveredGroup> = Vec::new();
+    for d in items {
+        let key = d.name.trim();
+        match groups
+            .iter_mut()
+            .find(|g| g.name.trim().eq_ignore_ascii_case(key))
+        {
+            Some(g) => {
+                if !g.macs.contains(&d.mac) {
+                    g.macs.push(d.mac.clone());
+                }
+            }
+            None => groups.push(DiscoveredGroup {
+                name: d.name.clone(),
+                macs: vec![d.mac.clone()],
+            }),
+        }
+    }
+    groups
+}
+
+/// Order one group's addresses best-first for pairing. Costs one `info` call
+/// per address, so it runs at pair time on a single group — never during the
+/// scan.
+pub fn rank_candidates(macs: &[String]) -> Vec<String> {
+    let mut scored: Vec<(u8, usize, String)> = macs
+        .iter()
+        .enumerate()
+        .map(|(i, mac)| {
+            let info = info(mac).unwrap_or_default();
+            (candidate_rank(info.audio, info.addr), i, mac.clone())
+        })
+        .collect();
+    // Stable on rank ties: keep discovery order as the tiebreak.
+    scored.sort_by_key(|(rank, i, _)| (*rank, *i));
+    scored.into_iter().map(|(_, _, mac)| mac).collect()
+}
+
+/// Lower is better. An unpaired classic device often hasn't been SDP-probed
+/// yet and so advertises no UUIDs at all — a public address with no known
+/// audio profile still outranks a confirmed LE-only one, because LE Audio
+/// needs host support that classic audio does not.
+fn candidate_rank(audio: AudioKind, addr: AddrKind) -> u8 {
+    match (audio, addr) {
+        (AudioKind::Classic, _) => 0,
+        (AudioKind::None, AddrKind::Public) => 1,
+        (AudioKind::LeAudioOnly, AddrKind::Public) => 2,
+        (AudioKind::LeAudioOnly, _) => 3,
+        (AudioKind::None, _) => 4,
+    }
+}
+
 pub fn connect(mac: &str) -> bool {
     btctl(&["connect", mac]).0
 }
@@ -577,11 +712,90 @@ mod tests {
             Info {
                 connected: false,
                 trusted: true,
-                audio: true,
+                audio: AudioKind::Classic,
+                addr: AddrKind::Public,
                 battery: Some(80),
             }
         );
         assert_eq!(parse_info(""), Info::default());
+    }
+
+    #[test]
+    fn detects_le_audio_only_device() {
+        // Real Buds3 Pro advertisement: BAP services, no A2DP Audio Sink.
+        let out = "Device A0:B0:BD:F3:BA:7E (public)\n\
+                   \tName: Buds3 Pro\n\
+                   \tUUID: Volume Control           (00001844-0000-1000-8000-00805f9b34fb)\n\
+                   \tUUID: Audio Stream Control     (0000184e-0000-1000-8000-00805f9b34fb)\n\
+                   \tUUID: Published Audio Capabil.. (00001850-0000-1000-8000-00805f9b34fb)\n\
+                   \tUUID: Common Audio             (00001853-0000-1000-8000-00805f9b34fb)\n";
+        let info = parse_info(out);
+        assert_eq!(info.audio, AudioKind::LeAudioOnly);
+        assert!(info.audio.routable());
+    }
+
+    #[test]
+    fn a2dp_wins_when_a_device_offers_both() {
+        let out = "Device AA:BB:CC:DD:EE:FF (public)\n\
+                   \tUUID: Audio Sink               (0000110b-0000-1000-8000-00805f9b34fb)\n\
+                   \tUUID: Audio Stream Control     (0000184e-0000-1000-8000-00805f9b34fb)\n";
+        assert_eq!(parse_info(out).audio, AudioKind::Classic);
+    }
+
+    #[test]
+    fn non_audio_device_is_not_routable() {
+        let out = "Device AA:BB:CC:DD:EE:FF (random)\n\
+                   \tUUID: Human Interface Device   (00001812-0000-1000-8000-00805f9b34fb)\n";
+        let info = parse_info(out);
+        assert_eq!(info.audio, AudioKind::None);
+        assert_eq!(info.addr, AddrKind::Random);
+        assert!(!info.audio.routable());
+    }
+
+    #[test]
+    fn groups_discovered_by_name() {
+        let items = vec![
+            Discovered {
+                mac: "40:7E:72:67:25:64".into(),
+                name: "Pavel's Buds3 Pro".into(),
+            },
+            Discovered {
+                mac: "7C:AF:C1:52:DC:A8".into(),
+                name: "Pavel's Buds3 Pro".into(),
+            },
+            Discovered {
+                mac: "78:C1:1D:12:D4:96".into(),
+                name: "S26 Ultra".into(),
+            },
+            // A duplicate address must not be listed twice.
+            Discovered {
+                mac: "40:7E:72:67:25:64".into(),
+                name: "Pavel's Buds3 Pro".into(),
+            },
+        ];
+        let groups = group_discovered(&items);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].name, "Pavel's Buds3 Pro");
+        assert_eq!(groups[0].macs.len(), 2);
+        assert_eq!(groups[1].macs, vec!["78:C1:1D:12:D4:96"]);
+    }
+
+    #[test]
+    fn ranks_classic_audio_above_le_only() {
+        // The exact trap: an LE-only address must never be tried before a
+        // classic one, and an unprobed public address beats a known LE one.
+        assert!(
+            candidate_rank(AudioKind::Classic, AddrKind::Public)
+                < candidate_rank(AudioKind::LeAudioOnly, AddrKind::Public)
+        );
+        assert!(
+            candidate_rank(AudioKind::None, AddrKind::Public)
+                < candidate_rank(AudioKind::LeAudioOnly, AddrKind::Public)
+        );
+        assert!(
+            candidate_rank(AudioKind::LeAudioOnly, AddrKind::Public)
+                < candidate_rank(AudioKind::LeAudioOnly, AddrKind::Random)
+        );
     }
 
     #[test]

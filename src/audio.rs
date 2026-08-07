@@ -35,6 +35,42 @@ fn find_sink(mac_underscored: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The bluez card for a device, if the audio backend built one. A card
+/// without a sink is the tell-tale of a profile that failed to start.
+pub fn card_for(mac: &str) -> Option<String> {
+    let mac_us = mac.replace(':', "_");
+    let (_, cards) = pactl(&["list", "short", "cards"]);
+    cards
+        .lines()
+        .filter_map(|l| field(l, 1))
+        .find(|c| sink_matches(c, &mac_us))
+        .map(str::to_string)
+}
+
+/// The sink for a device, if one exists right now.
+pub fn sink_for(mac: &str) -> Option<String> {
+    find_sink(&mac.replace(':', "_"))
+}
+
+/// Active profile of a device's bluez card, e.g. "a2dp-sink".
+pub fn active_profile(mac: &str) -> Option<String> {
+    let card = card_for(mac)?;
+    let (_, out) = pactl(&["list", "cards"]);
+    parse_card_profiles(&out, &card).0
+}
+
+/// Name of the running sound server ("PulseAudio (on PipeWire 1.0.5)"), for
+/// diagnostics.
+pub fn server_name() -> Option<String> {
+    let (ok, out) = pactl(&["info"]);
+    if !ok {
+        return None;
+    }
+    out.lines()
+        .find_map(|l| l.strip_prefix("Server Name: "))
+        .map(str::to_string)
+}
+
 fn short_sink_input_ids() -> Vec<String> {
     let (_, out) = pactl(&["list", "short", "sink-inputs"]);
     out.lines()
@@ -74,37 +110,41 @@ pub fn route_audio(mac: &str, progress: impl Fn(String)) -> bool {
     true
 }
 
-/// Toggle the device's card between its A2DP (high quality) and headset
-/// (mic-enabled) profiles. Returns the name of the newly active profile.
+/// A playback-quality profile: A2DP for classic audio, BAP for LE Audio.
+fn is_media_profile(p: &str) -> bool {
+    p.contains("a2dp") || p.contains("bap")
+}
+
+/// A profile that also opens a microphone, at reduced playback quality.
+fn is_headset_profile(p: &str) -> bool {
+    p.contains("headset") || p.contains("handsfree") || p.contains("hfp")
+}
+
+/// Toggle the device's card between its high-quality playback profile
+/// (A2DP or LE Audio BAP) and its headset (mic-enabled) profile. Returns the
+/// name of the newly active profile.
 pub fn toggle_profile(mac: &str) -> Result<String, String> {
-    let mac_us = mac.replace(':', "_");
-    let (_, cards) = pactl(&["list", "short", "cards"]);
-    let card = cards
-        .lines()
-        .filter_map(|l| field(l, 1))
-        .find(|c| sink_matches(c, &mac_us))
-        .map(str::to_string)
-        .ok_or("no audio card for this device (is it connected?)")?;
+    let card = card_for(mac).ok_or("no audio card for this device (is it connected?)")?;
 
     let (_, out) = pactl(&["list", "cards"]);
     let (active, available) = parse_card_profiles(&out, &card);
     let active = active.ok_or("could not determine active profile")?;
 
-    let want_headset = active.contains("a2dp");
+    let want_headset = is_media_profile(&active);
     let target = available
         .iter()
         .find(|p| {
             if want_headset {
-                p.contains("headset") || p.contains("handsfree") || p.contains("hfp")
+                is_headset_profile(p)
             } else {
-                p.contains("a2dp")
+                is_media_profile(p)
             }
         })
         .ok_or_else(|| {
             if want_headset {
                 "device has no headset/mic profile".to_string()
             } else {
-                "device has no A2DP profile".to_string()
+                "device has no high-quality playback profile".to_string()
             }
         })?;
 
@@ -197,6 +237,31 @@ mod tests {
         let (none, empty) = parse_card_profiles(out, "bluez_card.other");
         assert_eq!(none, None);
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn recognizes_le_audio_profiles() {
+        assert!(is_media_profile("a2dp-sink"));
+        assert!(is_media_profile("a2dp-sink-sbc_xq"));
+        assert!(is_media_profile("bap-sink"));
+        assert!(!is_media_profile("headset-head-unit"));
+        assert!(is_headset_profile("headset-head-unit-msbc"));
+        assert!(!is_headset_profile("bap-sink"));
+    }
+
+    #[test]
+    fn toggles_away_from_an_le_audio_profile() {
+        // A BAP card must offer the headset direction, not error out.
+        let out = "Card #9\n\
+                   \tName: bluez_card.AA_BB_CC_DD_EE_FF\n\
+                   \tProfiles:\n\
+                   \t\tbap-sink: High Fidelity Playback (BAP Sink) (sinks: 1, sources: 0, priority: 40, available: yes)\n\
+                   \t\theadset-head-unit: Headset Head Unit (HSP/HFP) (sinks: 1, sources: 1, priority: 30, available: yes)\n\
+                   \tActive Profile: bap-sink\n";
+        let (active, avail) = parse_card_profiles(out, "bluez_card.AA_BB_CC_DD_EE_FF");
+        assert_eq!(active.as_deref(), Some("bap-sink"));
+        assert!(is_media_profile(active.as_deref().unwrap()));
+        assert!(avail.iter().any(|p| is_headset_profile(p)));
     }
 
     #[test]

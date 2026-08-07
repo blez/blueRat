@@ -69,6 +69,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ("/", "Filter"),
             ("t", "Trust"),
             ("x", "Remove"),
+            ("d", "Doctor"),
             ("r", "Refresh"),
             ("q", "Quit"),
         ],
@@ -116,9 +117,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (content, LogSlot::Bottom(bottom))
     };
 
+    // One row per device name; a device advertising several addresses is a
+    // single pickable entry (the worker chooses which address to pair).
+    let scan_groups = app.scan_groups();
+
     match &app.view {
-        View::ScanResults { items, selected } => {
-            if items.is_empty() {
+        View::ScanResults { selected, .. } => {
+            if scan_groups.is_empty() {
                 let block = panel_block(Line::from(Span::styled(" 󰐷 New Devices ", bold(ORANGE))));
                 frame.render_widget(&block, panel_area);
                 let avail = block.inner(panel_area);
@@ -132,14 +137,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     msg_area,
                 );
             } else {
-                let rows: Vec<ListItem> = items
+                let rows: Vec<ListItem> = scan_groups
                     .iter()
-                    .map(|d| {
-                        ListItem::new(Line::from(vec![
+                    .map(|g| {
+                        let mut spans = vec![
                             Span::styled("󰐗 ", fg(ORANGE)),
-                            Span::styled(d.name.clone(), fg(SNOW)),
-                            Span::styled(format!("  {}", d.mac), fg(SLATE)),
-                        ]))
+                            Span::styled(g.name.clone(), fg(SNOW)),
+                            Span::styled(format!("  {}", g.macs[0]), fg(SLATE)),
+                        ];
+                        // Earbuds announce several addresses at once; say so
+                        // rather than showing the same name three times.
+                        if g.macs.len() > 1 {
+                            spans.push(Span::styled(
+                                format!("  +{} more", g.macs.len() - 1),
+                                fg(ICE),
+                            ));
+                        }
+                        ListItem::new(Line::from(spans))
                     })
                     .collect();
                 render_panel(
@@ -149,7 +163,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     None,
                     rows,
                     *selected,
-                    items.len(),
+                    scan_groups.len(),
                 );
             }
         }

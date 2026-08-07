@@ -3,6 +3,7 @@
 mod app;
 mod audio;
 mod bt;
+mod diag;
 mod ui;
 mod worker;
 
@@ -27,7 +28,52 @@ fn have(bin: &str) -> bool {
     )
 }
 
+const USAGE: &str = "\
+bluerat — TUI Bluetooth manager for Linux
+
+USAGE:
+    bluerat [OPTIONS]
+
+OPTIONS:
+    --doctor [MAC]  print Bluetooth audio diagnostics and exit; with a MAC,
+                    also check that one device
+    -h, --help      show this help
+    -V, --version   show the version
+";
+
 fn main() {
+    // Flags are handled before anything else so --help/--doctor work even
+    // when the environment is too broken to start the UI. Every flag exits,
+    // so only the first one is meaningful.
+    if let Some(arg) = std::env::args().nth(1) {
+        match arg.as_str() {
+            "--doctor" => {
+                if !have("bluetoothctl") {
+                    eprintln!("error: 'bluetoothctl' not found — install the 'bluez' package");
+                    exit(1);
+                }
+                let mac = std::env::args().nth(2);
+                print!(
+                    "{}",
+                    diag::report(mac.as_deref().map(|m| (m, "selected device")))
+                );
+                exit(0);
+            }
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                exit(0);
+            }
+            "-V" | "--version" => {
+                println!(concat!("bluerat ", env!("CARGO_PKG_VERSION")));
+                exit(0);
+            }
+            other => {
+                eprintln!("error: unknown argument '{other}'\n\n{USAGE}");
+                exit(2);
+            }
+        }
+    }
+
     // Check external tools before touching the terminal, so messages stay readable.
     if !have("bluetoothctl") {
         eprintln!("error: 'bluetoothctl' not found — install the 'bluez' package");

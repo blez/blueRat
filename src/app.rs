@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::bt::{self, Device, Discovered};
+use crate::bt::{self, Device, Discovered, DiscoveredGroup};
 use crate::worker::{Cmd, Msg, Tone};
 
 /// Info/Ok log entries disappear this long after being pushed. Warn/Err
@@ -18,6 +18,9 @@ pub const LOG_MAX: usize = 4;
 pub enum View {
     DeviceList,
     ScanResults {
+        /// Every discovered address, kept raw so a pair failure can reopen
+        /// the picker unchanged. The rows the user sees are
+        /// `bt::group_discovered(items)` — one per device name.
         items: Vec<Discovered>,
         selected: usize,
     },
@@ -135,6 +138,15 @@ impl App {
         self.visible().get(self.selected).map(|&i| &self.devices[i])
     }
 
+    /// Rows shown in the scan picker: one per device name, however many
+    /// addresses it advertises.
+    pub fn scan_groups(&self) -> Vec<DiscoveredGroup> {
+        match &self.view {
+            View::ScanResults { items, .. } => bt::group_discovered(items),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn handle_msg(&mut self, msg: Msg) {
         match msg {
             Msg::Devices(mut devices) => {
@@ -173,16 +185,22 @@ impl App {
                 }
                 if !new_items.is_empty() {
                     // The final list arrives in bluetoothd cache order, not
-                    // stream order — re-anchor the cursor by MAC so it stays
-                    // on the device the user highlighted.
-                    let anchor = match &self.view {
-                        View::ScanResults { items, selected } => {
-                            items.get(*selected).map(|d| d.mac.clone())
-                        }
-                        _ => None,
-                    };
+                    // stream order — re-anchor the cursor by name (the rows
+                    // are grouped by it) so it stays on the device the user
+                    // highlighted.
+                    let anchor = self
+                        .scan_groups()
+                        .get(match &self.view {
+                            View::ScanResults { selected, .. } => *selected,
+                            _ => 0,
+                        })
+                        .map(|g| g.name.clone());
                     let selected = anchor
-                        .and_then(|mac| new_items.iter().position(|d| d.mac == mac))
+                        .and_then(|name| {
+                            bt::group_discovered(&new_items)
+                                .iter()
+                                .position(|g| g.name == name)
+                        })
                         .unwrap_or(0);
                     self.view = View::ScanResults {
                         items: new_items,
@@ -316,12 +334,13 @@ impl App {
                     _ => self.view = View::DeviceList,
                 },
                 KeyCode::Enter => {
+                    let groups = self.scan_groups();
                     if let View::ScanResults { items, selected } = &self.view
-                        && let Some(d) = items.get(*selected)
+                        && let Some(g) = groups.get(*selected)
                     {
                         let cmd = Cmd::PairConnect {
-                            mac: d.mac.clone(),
-                            name: d.name.clone(),
+                            candidates: g.macs.clone(),
+                            name: g.name.clone(),
                             others: items.clone(),
                         };
                         self.ignore_scan_results = true;
@@ -408,36 +427,49 @@ impl App {
                     self.begin("Refreshing…");
                     return Some(Cmd::Refresh);
                 }
-                _ => {}
-            },
-            View::ScanResults { items, selected } => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    // A straggling final scan list must not reopen the
-                    // picker the user just closed.
-                    self.ignore_scan_results = true;
-                    self.view = View::DeviceList;
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    *selected = (*selected + 1).min(items.len().saturating_sub(1));
-                }
-                KeyCode::Char('k') | KeyCode::Up => *selected = selected.saturating_sub(1),
-                KeyCode::Char('g') => *selected = 0,
-                KeyCode::Char('G') => *selected = items.len().saturating_sub(1),
-                KeyCode::Enter => {
-                    let d = items.get(*selected)?;
-                    let cmd = Cmd::PairConnect {
-                        mac: d.mac.clone(),
-                        name: d.name.clone(),
-                        // Hand the list to the worker so a pair failure can
-                        // reopen the picker without another 10s scan.
-                        others: items.clone(),
-                    };
-                    self.view = View::DeviceList;
-                    self.begin("Pairing…");
-                    return Some(cmd);
+                KeyCode::Char('d') => {
+                    // Diagnostics work with no device selected too — a missing
+                    // audio backend is a host problem, not a device one.
+                    let device = self.current().map(|d| (d.mac.clone(), d.name.clone()));
+                    self.begin("Running diagnostics…");
+                    return Some(Cmd::Doctor { device });
                 }
                 _ => {}
             },
+            View::ScanResults { .. } => {
+                let groups = self.scan_groups();
+                let View::ScanResults { items, selected } = &mut self.view else {
+                    unreachable!("matched above")
+                };
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        // A straggling final scan list must not reopen the
+                        // picker the user just closed.
+                        self.ignore_scan_results = true;
+                        self.view = View::DeviceList;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        *selected = (*selected + 1).min(groups.len().saturating_sub(1));
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => *selected = selected.saturating_sub(1),
+                    KeyCode::Char('g') => *selected = 0,
+                    KeyCode::Char('G') => *selected = groups.len().saturating_sub(1),
+                    KeyCode::Enter => {
+                        let g = groups.get(*selected)?;
+                        let cmd = Cmd::PairConnect {
+                            candidates: g.macs.clone(),
+                            name: g.name.clone(),
+                            // Hand the list to the worker so a pair failure can
+                            // reopen the picker without another 10s scan.
+                            others: items.clone(),
+                        };
+                        self.view = View::DeviceList;
+                        self.begin("Pairing…");
+                        return Some(cmd);
+                    }
+                    _ => {}
+                }
+            }
             View::ConfirmRemove { mac, .. } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     let cmd = Cmd::Remove { mac: mac.clone() };
@@ -467,7 +499,8 @@ impl App {
 
     fn move_sel(&mut self, delta: i64) {
         let len = match &self.view {
-            View::ScanResults { items, .. } => items.len(),
+            // The picker shows one row per group, not per address.
+            View::ScanResults { .. } => self.scan_groups().len(),
             _ => self.visible().len(),
         };
         if len == 0 {
@@ -602,13 +635,68 @@ mod tests {
     fn enter_pairs_mid_scan_and_suppresses_the_final_list() {
         let mut app = scanning_app();
         let cmd = app.handle_key(key(KeyCode::Enter));
-        assert!(
-            matches!(cmd, Some(Cmd::PairConnect { ref mac, .. }) if mac == "11:11:11:11:11:11")
-        );
+        assert!(matches!(cmd, Some(Cmd::PairConnect { ref candidates, .. })
+                if candidates == &["11:11:11:11:11:11"]));
         assert!(matches!(app.view, View::DeviceList));
         // The scan's own final list is dropped; the pairing runs next.
         app.handle_msg(Msg::ScanResults(vec![disc("11:11:11:11:11:11", "Buds A")]));
         assert!(matches!(app.view, View::DeviceList));
+    }
+
+    /// One pair of earbuds advertising three addresses must be one row, and
+    /// pairing it must hand the worker every address to try.
+    #[test]
+    fn picker_collapses_one_device_advertising_many_addresses() {
+        let mut app = app_with_devices();
+        app.begin("Scanning ~10s…");
+        app.pending = 1;
+        app.handle_msg(Msg::ScanStarted);
+        app.handle_msg(Msg::Found(disc("40:7E:72:67:25:64", "Buds3 Pro")));
+        app.handle_msg(Msg::Found(disc("7C:AF:C1:52:DC:A8", "Buds3 Pro")));
+        app.handle_msg(Msg::Found(disc("A0:B0:BD:F3:BA:41", "Buds3 Pro")));
+        app.handle_msg(Msg::Found(disc("78:C1:1D:12:D4:96", "Phone")));
+
+        let groups = app.scan_groups();
+        assert_eq!(groups.len(), 2, "three addresses, one device");
+        assert_eq!(groups[0].macs.len(), 3);
+
+        match app.handle_key(key(KeyCode::Enter)) {
+            Some(Cmd::PairConnect {
+                candidates, name, ..
+            }) => {
+                assert_eq!(name, "Buds3 Pro");
+                assert_eq!(candidates.len(), 3, "worker gets every address to try");
+            }
+            _ => panic!("Enter should pair the highlighted group"),
+        }
+    }
+
+    /// Navigation must step over rows, not over raw addresses — otherwise
+    /// `j` appears to do nothing while the cursor walks a collapsed group.
+    #[test]
+    fn picker_navigation_steps_over_groups() {
+        let mut app = app_with_devices();
+        app.begin("Scanning ~10s…");
+        app.pending = 1;
+        app.handle_msg(Msg::ScanStarted);
+        app.handle_msg(Msg::Found(disc("40:7E:72:67:25:64", "Buds3 Pro")));
+        app.handle_msg(Msg::Found(disc("7C:AF:C1:52:DC:A8", "Buds3 Pro")));
+        app.handle_msg(Msg::Found(disc("78:C1:1D:12:D4:96", "Phone")));
+
+        app.handle_key(key(KeyCode::Char('j')));
+        match app.handle_key(key(KeyCode::Enter)) {
+            Some(Cmd::PairConnect { name, .. }) => assert_eq!(name, "Phone"),
+            _ => panic!("one j should land on the second group"),
+        }
+    }
+
+    #[test]
+    fn doctor_key_works_with_no_device_selected() {
+        let mut app = App::new();
+        match app.handle_key(key(KeyCode::Char('d'))) {
+            Some(Cmd::Doctor { device }) => assert!(device.is_none()),
+            _ => panic!("d should run host-only diagnostics"),
+        }
     }
 
     #[test]
